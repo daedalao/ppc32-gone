@@ -1,0 +1,43 @@
+From 261a0a2e5202ee80350c754168b3a4f041f3867b Mon Sep 17 00:00:00 2001
+From: daedalao <daedalao@hotmail.com>
+Date: Wed, 9 Sep 2026 16:44:37 -0700
+Subject: [PATCH 13/13] runtime: drop SIGPROF samples taken inside emulated
+ 64-bit atomics on linux/ppc
+
+linux/ppc emulates 64-bit atomics with a spinlock, like mips and arm. If
+SIGPROF interrupts the critical section, sigprof's own atomic.Load64 in
+profBuf.write spins forever on the same lock, inside the signal handler,
+with all signals blocked. Apply the existing mips/arm workaround: count
+the sample as lost and return.
+
+Found by runtime/pprof TestGoroutineSwitch hanging on a PowerBook G4.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0117Su2urNmg96oYM6vhHi1y
+---
+ src/runtime/proc.go | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/runtime/proc.go b/src/runtime/proc.go
+index 79f82c2ed4..6798bfd275 100644
+--- a/src/runtime/proc.go
++++ b/src/runtime/proc.go
+@@ -5809,13 +5809,13 @@ func sigprof(pc, sp, lr uintptr, gp *g, mp *m) {
+ 		return
+ 	}
+ 
+-	// On mips{,le}/arm, 64bit atomics are emulated with spinlocks, in
++	// On mips{,le}/arm/ppc, 64bit atomics are emulated with spinlocks, in
+ 	// internal/runtime/atomic. If SIGPROF arrives while the program is inside
+ 	// the critical section, it creates a deadlock (when writing the sample).
+ 	// As a workaround, create a counter of SIGPROFs while in critical section
+ 	// to store the count, and pass it to sigprof.add() later when SIGPROF is
+ 	// received from somewhere else (with _LostSIGPROFDuringAtomic64 as pc).
+-	if GOARCH == "mips" || GOARCH == "mipsle" || GOARCH == "arm" {
++	if GOARCH == "mips" || GOARCH == "mipsle" || GOARCH == "arm" || GOARCH == "ppc" {
+ 		if f := findfunc(pc); f.valid() {
+ 			if stringslite.HasPrefix(funcname(f), "internal/runtime/atomic") {
+ 				cpuprof.lostAtomic++
+-- 
+2.55.0
+

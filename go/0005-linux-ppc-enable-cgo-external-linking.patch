@@ -1,7 +1,7 @@
 From 468ec89989d6c17f2f1a5a9ffd8974a3ef155577 Mon Sep 17 00:00:00 2001
 From: daedalao <daedalao@hotmail.com>
 Date: Tue, 8 Sep 2026 21:12:19 -0700
-Subject: [PATCH 05/12] linux/ppc: enable cgo (external linking)
+Subject: [PATCH 05/13] linux/ppc: enable cgo (external linking)
 
 Add runtime/cgo crosscall glue for 32-bit ppc, use RELA relocations in
 the ELF32 object handed to the external linker, and mark linux/ppc as
