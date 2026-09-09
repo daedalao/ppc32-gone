@@ -1,0 +1,1524 @@
+From 8471fc322ab16e49710df7d5bc2522daec886a08 Mon Sep 17 00:00:00 2001
+From: daedalao <daedalao@hotmail.com>
+Date: Wed, 9 Sep 2026 02:08:31 -0700
+Subject: [PATCH 08/12] linux/ppc: PIE via external linking, math/bits
+ intrinsics, objdump support
+
+-buildmode=pie is now supported for linux/ppc. 32-bit PowerPC has no
+position-independent addressing mode, so the port keeps absolute
+addressing under -shared and links PIE binaries externally; GNU ld
+emits dynamic text relocations (DT_TEXTREL), which glibc's ld.so
+applies. The FIPS relocation check is skipped for ppc for that reason.
+
+Register the math/bits Len/TrailingZeros (cntlzw), RotateLeft32
+(rlwnm), math.Abs (fabs) and math.FMA (fmadd) intrinsics for ppc.
+
+Teach cmd/objdump about EM_PPC using the ppc64 decoder in big-endian mode.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0117Su2urNmg96oYM6vhHi1y
+---
+ src/cmd/compile/internal/base/flag.go         |    2 +-
+ src/cmd/compile/internal/ppc/ssa.go           |    9 +
+ src/cmd/compile/internal/ssa/_gen/PPC.rules   |    3 +
+ src/cmd/compile/internal/ssa/_gen/PPCOps.go   |    4 +-
+ .../internal/ssa/rewrite/ppc/rewritePPC.go    |    6 +
+ src/cmd/compile/internal/ssa/ssaop/opGen.go   |   17 +
+ src/cmd/compile/internal/ssagen/intrinsics.go |   18 +-
+ .../internal/ssagen/intrinsics_test.go        | 1136 +++++++++--------
+ src/cmd/compile/internal/ssagen/ssa.go        |    8 +-
+ src/cmd/internal/disasm/disasm.go             |    2 +
+ src/cmd/internal/obj/fips140.go               |    7 +
+ src/cmd/internal/obj/ppc64/asm9.go            |   12 +-
+ src/cmd/internal/objfile/elf.go               |    2 +
+ src/internal/platform/supported.go            |    2 +-
+ 14 files changed, 673 insertions(+), 555 deletions(-)
+
+diff --git a/src/cmd/compile/internal/base/flag.go b/src/cmd/compile/internal/base/flag.go
+index 05084df864..4870c3581d 100644
+--- a/src/cmd/compile/internal/base/flag.go
++++ b/src/cmd/compile/internal/base/flag.go
+@@ -298,7 +298,7 @@ func ParseFlags() {
+ 	if Flag.Race && !platform.RaceDetectorSupported(buildcfg.GOOS, buildcfg.GOARCH) {
+ 		log.Fatalf("%s/%s does not support -race", buildcfg.GOOS, buildcfg.GOARCH)
+ 	}
+-	if (*Flag.Shared || *Flag.Dynlink || *Flag.LinkShared) && !Ctxt.Arch.InFamily(sys.AMD64, sys.ARM, sys.ARM64, sys.I386, sys.Loong64, sys.MIPS64, sys.PPC64, sys.RISCV64, sys.S390X) {
++	if (*Flag.Shared || *Flag.Dynlink || *Flag.LinkShared) && !Ctxt.Arch.InFamily(sys.AMD64, sys.ARM, sys.ARM64, sys.I386, sys.Loong64, sys.MIPS64, sys.PPC, sys.PPC64, sys.RISCV64, sys.S390X) {
+ 		log.Fatalf("%s/%s does not support -shared", buildcfg.GOOS, buildcfg.GOARCH)
+ 	}
+ 	parseSpectre(Flag.Spectre) // left as string for RecordFlags
+diff --git a/src/cmd/compile/internal/ppc/ssa.go b/src/cmd/compile/internal/ppc/ssa.go
+index d609976a06..bcb70abc07 100644
+--- a/src/cmd/compile/internal/ppc/ssa.go
++++ b/src/cmd/compile/internal/ppc/ssa.go
+@@ -479,6 +479,15 @@ func ssaGenValue(s *ssagen.State, v *ssa.Value) {
+ 		p.From = obj.Addr{Type: obj.TYPE_REG, Reg: v.Args[1].Reg()}
+ 		p.AddRestSourceArgs([]obj.Addr{{Type: obj.TYPE_CONST, Offset: mb}, {Type: obj.TYPE_CONST, Offset: me}})
+ 
++	case ssaop.OpPPCFMADD:
++		// r = r1*r2 + r3
++		p := s.Prog(v.Op.Asm())
++		p.From.Type = obj.TYPE_REG
++		p.From.Reg = v.Args[0].Reg()
++		p.Reg = v.Args[2].Reg()
++		p.AddRestSourceReg(v.Args[1].Reg())
++		p.To.Type = obj.TYPE_REG
++		p.To.Reg = v.Reg()
+ 	case ssaop.OpPPCNEG, ssaop.OpPPCFNEG, ssaop.OpPPCFCTIWZ, ssaop.OpPPCFRSP, ssaop.OpPPCCNTLZW,
+ 		ssaop.OpPPCFABS, ssaop.OpPPCFNABS:
+ 		r := v.Reg()
+diff --git a/src/cmd/compile/internal/ssa/_gen/PPC.rules b/src/cmd/compile/internal/ssa/_gen/PPC.rules
+index ec2d8a6469..f5d238b1a7 100644
+--- a/src/cmd/compile/internal/ssa/_gen/PPC.rules
++++ b/src/cmd/compile/internal/ssa/_gen/PPC.rules
+@@ -192,6 +192,9 @@
+ 
+ // bit length
+ (BitLen32 <t> x) => (SUBFCconst [32] (CNTLZW <t> x))
++
++(Abs ...) => (FABS ...)
++(FMA ...) => (FMADD ...)
+ (BitLen(16|8) x) => (BitLen32 (ZeroExt(16|8)to32 x))
+ 
+ // float-int conversion
+diff --git a/src/cmd/compile/internal/ssa/_gen/PPCOps.go b/src/cmd/compile/internal/ssa/_gen/PPCOps.go
+index 7763f4d8be..b875b0b004 100644
+--- a/src/cmd/compile/internal/ssa/_gen/PPCOps.go
++++ b/src/cmd/compile/internal/ssa/_gen/PPCOps.go
+@@ -151,6 +151,7 @@ func init() {
+ 		fpgp        = regInfo{inputs: []regMask{fp}, outputs: []regMask{gp}}
+ 		gpfptmp     = regInfo{inputs: []regMask{gp}, outputs: []regMask{fp}, clobbers: tmp}
+ 		fp21        = regInfo{inputs: []regMask{fp, fp}, outputs: []regMask{fp}}
++		fp31        = regInfo{inputs: []regMask{fp, fp, fp}, outputs: []regMask{fp}}
+ 		fp2cr       = regInfo{inputs: []regMask{fp, fp}}
+ 		fpload      = regInfo{inputs: []regMask{gpspsb}, outputs: []regMask{fp}}
+ 		fploadidx   = regInfo{inputs: []regMask{gpspsb, gpspsb}, outputs: []regMask{fp}}
+@@ -235,7 +236,8 @@ func init() {
+ 		{name: "EQV", argLength: 2, reg: gp21, asm: "EQV", typ: "Int32", commutative: true, earlyOk: true},                                                                           // arg0^^arg1
+ 		{name: "NEG", argLength: 1, reg: gp11, asm: "NEG", typ: "Int32", earlyOk: true},                                                                                              // -arg0 (integer)
+ 		{name: "FNEG", argLength: 1, reg: fp11, asm: "FNEG", earlyOk: true},                                                                                                          // -arg0 (floating point)
+-		{name: "FABS", argLength: 1, reg: fp11, asm: "FABS", earlyOk: true},                                                                                                          // abs(arg0), float64
++		{name: "FABS", argLength: 1, reg: fp11, asm: "FABS", earlyOk: true},
++		{name: "FMADD", argLength: 3, reg: fp31, asm: "FMADD", earlyOk: true}, // arg0*arg1 + arg2, float64 (fused)                                                                                                          // abs(arg0), float64
+ 		{name: "FNABS", argLength: 1, reg: fp11, asm: "FNABS", earlyOk: true},                                                                                                        // -abs(arg0), float64
+ 		{name: "ORconst", argLength: 1, reg: gp11, asm: "OR", aux: "Int32", typ: "Int32", earlyOk: true},                                                                             // arg0|aux
+ 		{name: "XORconst", argLength: 1, reg: gp11, asm: "XOR", aux: "Int32", typ: "Int32", earlyOk: true},                                                                           // arg0^aux
+diff --git a/src/cmd/compile/internal/ssa/rewrite/ppc/rewritePPC.go b/src/cmd/compile/internal/ssa/rewrite/ppc/rewritePPC.go
+index 1210dd4f22..7585dd447c 100644
+--- a/src/cmd/compile/internal/ssa/rewrite/ppc/rewritePPC.go
++++ b/src/cmd/compile/internal/ssa/rewrite/ppc/rewritePPC.go
+@@ -9,6 +9,9 @@ import "cmd/compile/internal/ssa"
+ 
+ func RewriteValue(v *ssa.Value) bool {
+ 	switch v.Op {
++	case ssaop.OpAbs:
++		v.Op = ssaop.OpPPCFABS
++		return true
+ 	case ssaop.OpAdd16:
+ 		v.Op = ssaop.OpPPCADD
+ 		return true
+@@ -184,6 +187,9 @@ func RewriteValue(v *ssa.Value) bool {
+ 		return rewriteValue_OpEqB(v)
+ 	case ssaop.OpEqPtr:
+ 		return rewriteValue_OpEqPtr(v)
++	case ssaop.OpFMA:
++		v.Op = ssaop.OpPPCFMADD
++		return true
+ 	case ssaop.OpGetCallerPC:
+ 		v.Op = ssaop.OpPPCLoweredGetCallerPC
+ 		return true
+diff --git a/src/cmd/compile/internal/ssa/ssaop/opGen.go b/src/cmd/compile/internal/ssa/ssaop/opGen.go
+index e6f5f7b59c..7a05519e09 100644
+--- a/src/cmd/compile/internal/ssa/ssaop/opGen.go
++++ b/src/cmd/compile/internal/ssa/ssaop/opGen.go
+@@ -5761,6 +5761,7 @@ const (
+ 	OpPPCNEG
+ 	OpPPCFNEG
+ 	OpPPCFABS
++	OpPPCFMADD
+ 	OpPPCFNABS
+ 	OpPPCORconst
+ 	OpPPCXORconst
+@@ -96694,6 +96695,22 @@ var OpcodeTable = [...]OpInfo{
+ 			},
+ 		},
+ 	},
++	{
++		Name:    "FMADD",
++		ArgLen:  3,
++		EarlyOk: true,
++		asm:     ppc64.AFMADD,
++		Reg: RegInfo{
++			Inputs: []InputInfo{
++				{0, RegMask{V1: 9223372032559808512, V2: 0}}, // F0 F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 F12 F13 F14 F15 F16 F17 F18 F19 F20 F21 F22 F23 F24 F25 F26 F27 F28 F29 F30
++				{1, RegMask{V1: 9223372032559808512, V2: 0}}, // F0 F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 F12 F13 F14 F15 F16 F17 F18 F19 F20 F21 F22 F23 F24 F25 F26 F27 F28 F29 F30
++				{2, RegMask{V1: 9223372032559808512, V2: 0}}, // F0 F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 F12 F13 F14 F15 F16 F17 F18 F19 F20 F21 F22 F23 F24 F25 F26 F27 F28 F29 F30
++			},
++			Outputs: []OutputInfo{
++				{0, RegMask{V1: 9223372032559808512, V2: 0}}, // F0 F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 F12 F13 F14 F15 F16 F17 F18 F19 F20 F21 F22 F23 F24 F25 F26 F27 F28 F29 F30
++			},
++		},
++	},
+ 	{
+ 		Name:    "FNABS",
+ 		ArgLen:  1,
+diff --git a/src/cmd/compile/internal/ssagen/intrinsics.go b/src/cmd/compile/internal/ssagen/intrinsics.go
+index 5694be3614..f026e000ed 100644
+--- a/src/cmd/compile/internal/ssagen/intrinsics.go
++++ b/src/cmd/compile/internal/ssagen/intrinsics.go
+@@ -773,7 +773,7 @@ func initIntrinsics(cfg *intrinsicBuildConfig) {
+ 		func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
+ 			return s.newValue1(ssaop.OpAbs, types.Types[types.TFLOAT64], args[0])
+ 		},
+-		sys.ARM64, sys.ARM, sys.Loong64, sys.PPC64, sys.RISCV64, sys.Wasm, sys.MIPS, sys.MIPS64)
++		sys.ARM64, sys.ARM, sys.Loong64, sys.PPC, sys.PPC64, sys.RISCV64, sys.Wasm, sys.MIPS, sys.MIPS64)
+ 	addF("math", "Copysign",
+ 		func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
+ 			return s.newValue2(ssaop.OpCopysign, types.Types[types.TFLOAT64], args[0], args[1])
+@@ -783,7 +783,7 @@ func initIntrinsics(cfg *intrinsicBuildConfig) {
+ 		func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
+ 			return s.newValue3(ssaop.OpFMA, types.Types[types.TFLOAT64], args[0], args[1], args[2])
+ 		},
+-		sys.ARM64, sys.Loong64, sys.PPC64, sys.RISCV64, sys.S390X)
++		sys.ARM64, sys.Loong64, sys.PPC, sys.PPC64, sys.RISCV64, sys.S390X)
+ 	addF("math", "FMA",
+ 		func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
+ 			if cfg.goamd64 >= 3 {
+@@ -950,17 +950,17 @@ func initIntrinsics(cfg *intrinsicBuildConfig) {
+ 		func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
+ 			return s.newValue1(ssaop.OpCtz32, types.Types[types.TINT], args[0])
+ 		},
+-		sys.AMD64, sys.I386, sys.ARM64, sys.ARM, sys.Loong64, sys.S390X, sys.MIPS, sys.PPC64, sys.Wasm)
++		sys.AMD64, sys.I386, sys.ARM64, sys.ARM, sys.Loong64, sys.S390X, sys.MIPS, sys.PPC, sys.PPC64, sys.Wasm)
+ 	addF("math/bits", "TrailingZeros16",
+ 		func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
+ 			return s.newValue1(ssaop.OpCtz16, types.Types[types.TINT], args[0])
+ 		},
+-		sys.AMD64, sys.ARM, sys.ARM64, sys.I386, sys.MIPS, sys.Loong64, sys.PPC64, sys.S390X, sys.Wasm)
++		sys.AMD64, sys.ARM, sys.ARM64, sys.I386, sys.MIPS, sys.Loong64, sys.PPC, sys.PPC64, sys.S390X, sys.Wasm)
+ 	addF("math/bits", "TrailingZeros8",
+ 		func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
+ 			return s.newValue1(ssaop.OpCtz8, types.Types[types.TINT], args[0])
+ 		},
+-		sys.AMD64, sys.ARM, sys.ARM64, sys.I386, sys.MIPS, sys.Loong64, sys.PPC64, sys.S390X, sys.Wasm)
++		sys.AMD64, sys.ARM, sys.ARM64, sys.I386, sys.MIPS, sys.Loong64, sys.PPC, sys.PPC64, sys.S390X, sys.Wasm)
+ 
+ 	if cfg.goriscv64 >= 22 {
+ 		addF("math/bits", "TrailingZeros64",
+@@ -1019,17 +1019,17 @@ func initIntrinsics(cfg *intrinsicBuildConfig) {
+ 		func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
+ 			return s.newValue1(ssaop.OpBitLen32, types.Types[types.TINT], args[0])
+ 		},
+-		sys.AMD64, sys.ARM, sys.ARM64, sys.Loong64, sys.MIPS, sys.PPC64, sys.S390X, sys.Wasm)
++		sys.AMD64, sys.ARM, sys.ARM64, sys.Loong64, sys.MIPS, sys.PPC, sys.PPC64, sys.S390X, sys.Wasm)
+ 	addF("math/bits", "Len16",
+ 		func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
+ 			return s.newValue1(ssaop.OpBitLen16, types.Types[types.TINT], args[0])
+ 		},
+-		sys.AMD64, sys.ARM, sys.ARM64, sys.Loong64, sys.MIPS, sys.PPC64, sys.S390X, sys.Wasm)
++		sys.AMD64, sys.ARM, sys.ARM64, sys.Loong64, sys.MIPS, sys.PPC, sys.PPC64, sys.S390X, sys.Wasm)
+ 	addF("math/bits", "Len8",
+ 		func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
+ 			return s.newValue1(ssaop.OpBitLen8, types.Types[types.TINT], args[0])
+ 		},
+-		sys.AMD64, sys.ARM, sys.ARM64, sys.Loong64, sys.MIPS, sys.PPC64, sys.S390X, sys.Wasm)
++		sys.AMD64, sys.ARM, sys.ARM64, sys.Loong64, sys.MIPS, sys.PPC, sys.PPC64, sys.S390X, sys.Wasm)
+ 
+ 	if cfg.goriscv64 >= 22 {
+ 		addF("math/bits", "Len64",
+@@ -1097,7 +1097,7 @@ func initIntrinsics(cfg *intrinsicBuildConfig) {
+ 		func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
+ 			return s.newValue2(ssaop.OpRotateLeft32, types.Types[types.TUINT32], args[0], args[1])
+ 		},
+-		sys.AMD64, sys.ARM, sys.ARM64, sys.Loong64, sys.PPC64, sys.RISCV64, sys.S390X, sys.Wasm)
++		sys.AMD64, sys.ARM, sys.ARM64, sys.Loong64, sys.PPC, sys.PPC64, sys.RISCV64, sys.S390X, sys.Wasm)
+ 	addF("math/bits", "RotateLeft64",
+ 		func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
+ 			return s.newValue2(ssaop.OpRotateLeft64, types.Types[types.TUINT64], args[0], args[1])
+diff --git a/src/cmd/compile/internal/ssagen/intrinsics_test.go b/src/cmd/compile/internal/ssagen/intrinsics_test.go
+index 3de8b07a6e..cf75750cfb 100644
+--- a/src/cmd/compile/internal/ssagen/intrinsics_test.go
++++ b/src/cmd/compile/internal/ssagen/intrinsics_test.go
+@@ -825,541 +825,607 @@ var wantIntrinsics = map[testIntrinsicKey]struct{}{
+ 	{"mipsle", "sync/atomic", "SwapUint32"}:                            struct{}{},
+ 	{"mipsle", "sync/atomic", "SwapUintptr"}:                           struct{}{},
+ 	{"mipsle", "crypto/internal/constanttime", "boolToUint8"}:          struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "And"}:                        struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "And8"}:                       struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Cas"}:                        struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Cas64"}:                      struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "CasRel"}:                     struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Casint32"}:                   struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Casint64"}:                   struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Casp1"}:                      struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Casuintptr"}:                 struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Load"}:                       struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Load64"}:                     struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Load8"}:                      struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "LoadAcq"}:                    struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "LoadAcq64"}:                  struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "LoadAcquintptr"}:             struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Loadint32"}:                  struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Loadint64"}:                  struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Loadp"}:                      struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Loaduint"}:                   struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Loaduintptr"}:                struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Or"}:                         struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Or8"}:                        struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Store"}:                      struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Store64"}:                    struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Store8"}:                     struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "StoreRel"}:                   struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "StoreRel64"}:                 struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "StoreReluintptr"}:            struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Storeint32"}:                 struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Storeint64"}:                 struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Storeuintptr"}:               struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Xadd"}:                       struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Xadd64"}:                     struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Xaddint32"}:                  struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Xaddint64"}:                  struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Xadduintptr"}:                struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Xchg8"}:                      struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Xchg"}:                       struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Xchg64"}:                     struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Xchgint32"}:                  struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Xchgint64"}:                  struct{}{},
+-	{"ppc64", "internal/runtime/atomic", "Xchguintptr"}:                struct{}{},
+-	{"ppc64", "internal/runtime/math", "Add64"}:                        struct{}{},
+-	{"ppc64", "internal/runtime/math", "MulUintptr"}:                   struct{}{},
+-	{"ppc64", "internal/runtime/sys", "Bswap32"}:                       struct{}{},
+-	{"ppc64", "internal/runtime/sys", "Bswap64"}:                       struct{}{},
+-	{"ppc64", "internal/runtime/sys", "GetCallerPC"}:                   struct{}{},
+-	{"ppc64", "internal/runtime/sys", "GetCallerSP"}:                   struct{}{},
+-	{"ppc64", "internal/runtime/sys", "GetClosurePtr"}:                 struct{}{},
+-	{"ppc64", "internal/runtime/sys", "Len64"}:                         struct{}{},
+-	{"ppc64", "internal/runtime/sys", "Len8"}:                          struct{}{},
+-	{"ppc64", "internal/runtime/sys", "OnesCount64"}:                   struct{}{},
+-	{"ppc64", "internal/runtime/sys", "Prefetch"}:                      struct{}{},
+-	{"ppc64", "internal/runtime/sys", "PrefetchStreamed"}:              struct{}{},
+-	{"ppc64", "internal/runtime/sys", "TrailingZeros8"}:                struct{}{},
+-	{"ppc64", "internal/runtime/sys", "TrailingZeros32"}:               struct{}{},
+-	{"ppc64", "internal/runtime/sys", "TrailingZeros64"}:               struct{}{},
+-	{"ppc64", "math", "Abs"}:                                           struct{}{},
+-	{"ppc64", "math", "Ceil"}:                                          struct{}{},
+-	{"ppc64", "math", "Copysign"}:                                      struct{}{},
+-	{"ppc64", "math", "FMA"}:                                           struct{}{},
+-	{"ppc64", "math", "Floor"}:                                         struct{}{},
+-	{"ppc64", "math", "Round"}:                                         struct{}{},
+-	{"ppc64", "math", "Trunc"}:                                         struct{}{},
+-	{"ppc64", "math", "sqrt"}:                                          struct{}{},
+-	{"ppc64", "math/big", "mulWW"}:                                     struct{}{},
+-	{"ppc64", "math/bits", "Add"}:                                      struct{}{},
+-	{"ppc64", "math/bits", "Add64"}:                                    struct{}{},
+-	{"ppc64", "math/bits", "Len"}:                                      struct{}{},
+-	{"ppc64", "math/bits", "Len16"}:                                    struct{}{},
+-	{"ppc64", "math/bits", "Len32"}:                                    struct{}{},
+-	{"ppc64", "math/bits", "Len64"}:                                    struct{}{},
+-	{"ppc64", "math/bits", "Len8"}:                                     struct{}{},
+-	{"ppc64", "math/bits", "Mul"}:                                      struct{}{},
+-	{"ppc64", "math/bits", "Mul64"}:                                    struct{}{},
+-	{"ppc64", "math/bits", "OnesCount"}:                                struct{}{},
+-	{"ppc64", "math/bits", "OnesCount16"}:                              struct{}{},
+-	{"ppc64", "math/bits", "OnesCount32"}:                              struct{}{},
+-	{"ppc64", "math/bits", "OnesCount64"}:                              struct{}{},
+-	{"ppc64", "math/bits", "OnesCount8"}:                               struct{}{},
+-	{"ppc64", "math/bits", "ReverseBytes16"}:                           struct{}{},
+-	{"ppc64", "math/bits", "ReverseBytes32"}:                           struct{}{},
+-	{"ppc64", "math/bits", "ReverseBytes64"}:                           struct{}{},
+-	{"ppc64", "math/bits", "RotateLeft"}:                               struct{}{},
+-	{"ppc64", "math/bits", "RotateLeft32"}:                             struct{}{},
+-	{"ppc64", "math/bits", "RotateLeft64"}:                             struct{}{},
+-	{"ppc64", "math/bits", "Sub"}:                                      struct{}{},
+-	{"ppc64", "math/bits", "Sub64"}:                                    struct{}{},
+-	{"ppc64", "math/bits", "TrailingZeros8"}:                           struct{}{},
+-	{"ppc64", "math/bits", "TrailingZeros16"}:                          struct{}{},
+-	{"ppc64", "math/bits", "TrailingZeros32"}:                          struct{}{},
+-	{"ppc64", "math/bits", "TrailingZeros64"}:                          struct{}{},
+-	{"ppc64", "runtime", "KeepAlive"}:                                  struct{}{},
+-	{"ppc64", "runtime", "publicationBarrier"}:                         struct{}{},
+-	{"ppc64", "runtime", "slicebytetostringtmp"}:                       struct{}{},
+-	{"ppc64", "sync/atomic", "AddInt32"}:                               struct{}{},
+-	{"ppc64", "sync/atomic", "AddInt64"}:                               struct{}{},
+-	{"ppc64", "sync/atomic", "AddUint32"}:                              struct{}{},
+-	{"ppc64", "sync/atomic", "AddUint64"}:                              struct{}{},
+-	{"ppc64", "sync/atomic", "AddUintptr"}:                             struct{}{},
+-	{"ppc64", "sync/atomic", "CompareAndSwapInt32"}:                    struct{}{},
+-	{"ppc64", "sync/atomic", "CompareAndSwapInt64"}:                    struct{}{},
+-	{"ppc64", "sync/atomic", "CompareAndSwapUint32"}:                   struct{}{},
+-	{"ppc64", "sync/atomic", "CompareAndSwapUint64"}:                   struct{}{},
+-	{"ppc64", "sync/atomic", "CompareAndSwapUintptr"}:                  struct{}{},
+-	{"ppc64", "sync/atomic", "LoadInt32"}:                              struct{}{},
+-	{"ppc64", "sync/atomic", "LoadInt64"}:                              struct{}{},
+-	{"ppc64", "sync/atomic", "LoadPointer"}:                            struct{}{},
+-	{"ppc64", "sync/atomic", "LoadUint32"}:                             struct{}{},
+-	{"ppc64", "sync/atomic", "LoadUint64"}:                             struct{}{},
+-	{"ppc64", "sync/atomic", "LoadUintptr"}:                            struct{}{},
+-	{"ppc64", "sync/atomic", "StoreInt32"}:                             struct{}{},
+-	{"ppc64", "sync/atomic", "StoreInt64"}:                             struct{}{},
+-	{"ppc64", "sync/atomic", "StoreUint32"}:                            struct{}{},
+-	{"ppc64", "sync/atomic", "StoreUint64"}:                            struct{}{},
+-	{"ppc64", "sync/atomic", "StoreUintptr"}:                           struct{}{},
+-	{"ppc64", "sync/atomic", "SwapInt32"}:                              struct{}{},
+-	{"ppc64", "sync/atomic", "SwapInt64"}:                              struct{}{},
+-	{"ppc64", "sync/atomic", "SwapUint32"}:                             struct{}{},
+-	{"ppc64", "sync/atomic", "SwapUint64"}:                             struct{}{},
+-	{"ppc64", "sync/atomic", "SwapUintptr"}:                            struct{}{},
+-	{"ppc64", "crypto/internal/constanttime", "Select"}:                struct{}{},
+-	{"ppc64", "crypto/internal/constanttime", "boolToUint8"}:           struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "And"}:                      struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "And8"}:                     struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Cas"}:                      struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Cas64"}:                    struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "CasRel"}:                   struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Casint32"}:                 struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Casint64"}:                 struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Casp1"}:                    struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Casuintptr"}:               struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Load"}:                     struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Load64"}:                   struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Load8"}:                    struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "LoadAcq"}:                  struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "LoadAcq64"}:                struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "LoadAcquintptr"}:           struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Loadint32"}:                struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Loadint64"}:                struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Loadp"}:                    struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Loaduint"}:                 struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Loaduintptr"}:              struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Or"}:                       struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Or8"}:                      struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Store"}:                    struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Store64"}:                  struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Store8"}:                   struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "StoreRel"}:                 struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "StoreRel64"}:               struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "StoreReluintptr"}:          struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Storeint32"}:               struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Storeint64"}:               struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Storeuintptr"}:             struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Xadd"}:                     struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Xadd64"}:                   struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Xaddint32"}:                struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Xaddint64"}:                struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Xadduintptr"}:              struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Xchg8"}:                    struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Xchg"}:                     struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Xchg64"}:                   struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Xchgint32"}:                struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Xchgint64"}:                struct{}{},
+-	{"ppc64le", "internal/runtime/atomic", "Xchguintptr"}:              struct{}{},
+-	{"ppc64le", "internal/runtime/math", "Add64"}:                      struct{}{},
+-	{"ppc64le", "internal/runtime/math", "MulUintptr"}:                 struct{}{},
+-	{"ppc64le", "internal/runtime/sys", "Bswap32"}:                     struct{}{},
+-	{"ppc64le", "internal/runtime/sys", "Bswap64"}:                     struct{}{},
+-	{"ppc64le", "internal/runtime/sys", "GetCallerPC"}:                 struct{}{},
+-	{"ppc64le", "internal/runtime/sys", "GetCallerSP"}:                 struct{}{},
+-	{"ppc64le", "internal/runtime/sys", "GetClosurePtr"}:               struct{}{},
+-	{"ppc64le", "internal/runtime/sys", "Len64"}:                       struct{}{},
+-	{"ppc64le", "internal/runtime/sys", "Len8"}:                        struct{}{},
+-	{"ppc64le", "internal/runtime/sys", "OnesCount64"}:                 struct{}{},
+-	{"ppc64le", "internal/runtime/sys", "Prefetch"}:                    struct{}{},
+-	{"ppc64le", "internal/runtime/sys", "PrefetchStreamed"}:            struct{}{},
+-	{"ppc64le", "internal/runtime/sys", "TrailingZeros8"}:              struct{}{},
+-	{"ppc64le", "internal/runtime/sys", "TrailingZeros32"}:             struct{}{},
+-	{"ppc64le", "internal/runtime/sys", "TrailingZeros64"}:             struct{}{},
+-	{"ppc64le", "math", "Abs"}:                                         struct{}{},
+-	{"ppc64le", "math", "Ceil"}:                                        struct{}{},
+-	{"ppc64le", "math", "Copysign"}:                                    struct{}{},
+-	{"ppc64le", "math", "FMA"}:                                         struct{}{},
+-	{"ppc64le", "math", "Floor"}:                                       struct{}{},
+-	{"ppc64le", "math", "Round"}:                                       struct{}{},
+-	{"ppc64le", "math", "Trunc"}:                                       struct{}{},
+-	{"ppc64le", "math", "sqrt"}:                                        struct{}{},
+-	{"ppc64le", "math/big", "mulWW"}:                                   struct{}{},
+-	{"ppc64le", "math/bits", "Add"}:                                    struct{}{},
+-	{"ppc64le", "math/bits", "Add64"}:                                  struct{}{},
+-	{"ppc64le", "math/bits", "Len"}:                                    struct{}{},
+-	{"ppc64le", "math/bits", "Len16"}:                                  struct{}{},
+-	{"ppc64le", "math/bits", "Len32"}:                                  struct{}{},
+-	{"ppc64le", "math/bits", "Len64"}:                                  struct{}{},
+-	{"ppc64le", "math/bits", "Len8"}:                                   struct{}{},
+-	{"ppc64le", "math/bits", "Mul"}:                                    struct{}{},
+-	{"ppc64le", "math/bits", "Mul64"}:                                  struct{}{},
+-	{"ppc64le", "math/bits", "OnesCount"}:                              struct{}{},
+-	{"ppc64le", "math/bits", "OnesCount16"}:                            struct{}{},
+-	{"ppc64le", "math/bits", "OnesCount32"}:                            struct{}{},
+-	{"ppc64le", "math/bits", "OnesCount64"}:                            struct{}{},
+-	{"ppc64le", "math/bits", "OnesCount8"}:                             struct{}{},
+-	{"ppc64le", "math/bits", "ReverseBytes16"}:                         struct{}{},
+-	{"ppc64le", "math/bits", "ReverseBytes32"}:                         struct{}{},
+-	{"ppc64le", "math/bits", "ReverseBytes64"}:                         struct{}{},
+-	{"ppc64le", "math/bits", "RotateLeft"}:                             struct{}{},
+-	{"ppc64le", "math/bits", "RotateLeft32"}:                           struct{}{},
+-	{"ppc64le", "math/bits", "RotateLeft64"}:                           struct{}{},
+-	{"ppc64le", "math/bits", "Sub"}:                                    struct{}{},
+-	{"ppc64le", "math/bits", "Sub64"}:                                  struct{}{},
+-	{"ppc64le", "math/bits", "TrailingZeros8"}:                         struct{}{},
+-	{"ppc64le", "math/bits", "TrailingZeros16"}:                        struct{}{},
+-	{"ppc64le", "math/bits", "TrailingZeros32"}:                        struct{}{},
+-	{"ppc64le", "math/bits", "TrailingZeros64"}:                        struct{}{},
+-	{"ppc64le", "runtime", "KeepAlive"}:                                struct{}{},
+-	{"ppc64le", "runtime", "publicationBarrier"}:                       struct{}{},
+-	{"ppc64le", "runtime", "slicebytetostringtmp"}:                     struct{}{},
+-	{"ppc64le", "sync/atomic", "AddInt32"}:                             struct{}{},
+-	{"ppc64le", "sync/atomic", "AddInt64"}:                             struct{}{},
+-	{"ppc64le", "sync/atomic", "AddUint32"}:                            struct{}{},
+-	{"ppc64le", "sync/atomic", "AddUint64"}:                            struct{}{},
+-	{"ppc64le", "sync/atomic", "AddUintptr"}:                           struct{}{},
+-	{"ppc64le", "sync/atomic", "CompareAndSwapInt32"}:                  struct{}{},
+-	{"ppc64le", "sync/atomic", "CompareAndSwapInt64"}:                  struct{}{},
+-	{"ppc64le", "sync/atomic", "CompareAndSwapUint32"}:                 struct{}{},
+-	{"ppc64le", "sync/atomic", "CompareAndSwapUint64"}:                 struct{}{},
+-	{"ppc64le", "sync/atomic", "CompareAndSwapUintptr"}:                struct{}{},
+-	{"ppc64le", "sync/atomic", "LoadInt32"}:                            struct{}{},
+-	{"ppc64le", "sync/atomic", "LoadInt64"}:                            struct{}{},
+-	{"ppc64le", "sync/atomic", "LoadPointer"}:                          struct{}{},
+-	{"ppc64le", "sync/atomic", "LoadUint32"}:                           struct{}{},
+-	{"ppc64le", "sync/atomic", "LoadUint64"}:                           struct{}{},
+-	{"ppc64le", "sync/atomic", "LoadUintptr"}:                          struct{}{},
+-	{"ppc64le", "sync/atomic", "StoreInt32"}:                           struct{}{},
+-	{"ppc64le", "sync/atomic", "StoreInt64"}:                           struct{}{},
+-	{"ppc64le", "sync/atomic", "StoreUint32"}:                          struct{}{},
+-	{"ppc64le", "sync/atomic", "StoreUint64"}:                          struct{}{},
+-	{"ppc64le", "sync/atomic", "StoreUintptr"}:                         struct{}{},
+-	{"ppc64le", "sync/atomic", "SwapInt32"}:                            struct{}{},
+-	{"ppc64le", "sync/atomic", "SwapInt64"}:                            struct{}{},
+-	{"ppc64le", "sync/atomic", "SwapUint32"}:                           struct{}{},
+-	{"ppc64le", "sync/atomic", "SwapUint64"}:                           struct{}{},
+-	{"ppc64le", "sync/atomic", "SwapUintptr"}:                          struct{}{},
+-	{"ppc64le", "crypto/internal/constanttime", "Select"}:              struct{}{},
+-	{"ppc64le", "crypto/internal/constanttime", "boolToUint8"}:         struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "And"}:                      struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "And32"}:                    struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "And64"}:                    struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "And8"}:                     struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Cas"}:                      struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Cas64"}:                    struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "CasRel"}:                   struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Casint32"}:                 struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Casint64"}:                 struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Casp1"}:                    struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Casuintptr"}:               struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Load"}:                     struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Load64"}:                   struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Load8"}:                    struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "LoadAcq"}:                  struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "LoadAcq64"}:                struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "LoadAcquintptr"}:           struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Loadint32"}:                struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Loadint64"}:                struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Loadp"}:                    struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Loaduint"}:                 struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Loaduintptr"}:              struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Or"}:                       struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Or32"}:                     struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Or64"}:                     struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Or8"}:                      struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Store"}:                    struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Store64"}:                  struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Store8"}:                   struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "StoreRel"}:                 struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "StoreRel64"}:               struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "StoreReluintptr"}:          struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Storeint32"}:               struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Storeint64"}:               struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "StorepNoWB"}:               struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Storeuintptr"}:             struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Xadd"}:                     struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Xadd64"}:                   struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Xaddint32"}:                struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Xaddint64"}:                struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Xadduintptr"}:              struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Xchg"}:                     struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Xchg64"}:                   struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Xchgint32"}:                struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Xchgint64"}:                struct{}{},
+-	{"riscv64", "internal/runtime/atomic", "Xchguintptr"}:              struct{}{},
+-	{"riscv64", "internal/runtime/math", "Add64"}:                      struct{}{},
+-	{"riscv64", "internal/runtime/math", "MulUintptr"}:                 struct{}{},
+-	{"riscv64", "internal/runtime/sys", "Bswap32"}:                     struct{}{},
+-	{"riscv64", "internal/runtime/sys", "Bswap64"}:                     struct{}{},
+-	{"riscv64", "internal/runtime/sys", "GetCallerPC"}:                 struct{}{},
+-	{"riscv64", "internal/runtime/sys", "GetCallerSP"}:                 struct{}{},
+-	{"riscv64", "internal/runtime/sys", "GetClosurePtr"}:               struct{}{},
+-	{"riscv64", "internal/runtime/sys", "Len64"}:                       struct{}{},
+-	{"riscv64", "internal/runtime/sys", "Len8"}:                        struct{}{},
+-	{"riscv64", "internal/runtime/sys", "OnesCount64"}:                 struct{}{},
+-	{"riscv64", "internal/runtime/sys", "TrailingZeros32"}:             struct{}{},
+-	{"riscv64", "internal/runtime/sys", "TrailingZeros64"}:             struct{}{},
+-	{"riscv64", "internal/runtime/sys", "TrailingZeros8"}:              struct{}{},
+-	{"riscv64", "math", "Abs"}:                                         struct{}{},
+-	{"riscv64", "math", "Copysign"}:                                    struct{}{},
+-	{"riscv64", "math", "FMA"}:                                         struct{}{},
+-	{"riscv64", "math", "sqrt"}:                                        struct{}{},
+-	{"riscv64", "math/big", "mulWW"}:                                   struct{}{},
+-	{"riscv64", "math/bits", "Add"}:                                    struct{}{},
+-	{"riscv64", "math/bits", "Add64"}:                                  struct{}{},
+-	{"riscv64", "math/bits", "Len"}:                                    struct{}{},
+-	{"riscv64", "math/bits", "Len16"}:                                  struct{}{},
+-	{"riscv64", "math/bits", "Len32"}:                                  struct{}{},
+-	{"riscv64", "math/bits", "Len64"}:                                  struct{}{},
+-	{"riscv64", "math/bits", "Len8"}:                                   struct{}{},
+-	{"riscv64", "math/bits", "Mul"}:                                    struct{}{},
+-	{"riscv64", "math/bits", "Mul64"}:                                  struct{}{},
+-	{"riscv64", "math/bits", "OnesCount"}:                              struct{}{},
+-	{"riscv64", "math/bits", "OnesCount16"}:                            struct{}{},
+-	{"riscv64", "math/bits", "OnesCount32"}:                            struct{}{},
+-	{"riscv64", "math/bits", "OnesCount64"}:                            struct{}{},
+-	{"riscv64", "math/bits", "OnesCount8"}:                             struct{}{},
+-	{"riscv64", "math/bits", "ReverseBytes16"}:                         struct{}{},
+-	{"riscv64", "math/bits", "ReverseBytes32"}:                         struct{}{},
+-	{"riscv64", "math/bits", "ReverseBytes64"}:                         struct{}{},
+-	{"riscv64", "math/bits", "RotateLeft"}:                             struct{}{},
+-	{"riscv64", "math/bits", "RotateLeft16"}:                           struct{}{},
+-	{"riscv64", "math/bits", "RotateLeft32"}:                           struct{}{},
+-	{"riscv64", "math/bits", "RotateLeft64"}:                           struct{}{},
+-	{"riscv64", "math/bits", "RotateLeft8"}:                            struct{}{},
+-	{"riscv64", "math/bits", "Sub"}:                                    struct{}{},
+-	{"riscv64", "math/bits", "Sub64"}:                                  struct{}{},
+-	{"riscv64", "math/bits", "TrailingZeros16"}:                        struct{}{},
+-	{"riscv64", "math/bits", "TrailingZeros32"}:                        struct{}{},
+-	{"riscv64", "math/bits", "TrailingZeros64"}:                        struct{}{},
+-	{"riscv64", "math/bits", "TrailingZeros8"}:                         struct{}{},
+-	{"riscv64", "runtime", "KeepAlive"}:                                struct{}{},
+-	{"riscv64", "runtime", "publicationBarrier"}:                       struct{}{},
+-	{"riscv64", "runtime", "slicebytetostringtmp"}:                     struct{}{},
+-	{"riscv64", "sync/atomic", "AddInt32"}:                             struct{}{},
+-	{"riscv64", "sync/atomic", "AddInt64"}:                             struct{}{},
+-	{"riscv64", "sync/atomic", "AddUint32"}:                            struct{}{},
+-	{"riscv64", "sync/atomic", "AddUint64"}:                            struct{}{},
+-	{"riscv64", "sync/atomic", "AddUintptr"}:                           struct{}{},
+-	{"riscv64", "sync/atomic", "AndInt32"}:                             struct{}{},
+-	{"riscv64", "sync/atomic", "AndInt64"}:                             struct{}{},
+-	{"riscv64", "sync/atomic", "AndUint32"}:                            struct{}{},
+-	{"riscv64", "sync/atomic", "AndUint64"}:                            struct{}{},
+-	{"riscv64", "sync/atomic", "AndUintptr"}:                           struct{}{},
+-	{"riscv64", "sync/atomic", "CompareAndSwapInt32"}:                  struct{}{},
+-	{"riscv64", "sync/atomic", "CompareAndSwapInt64"}:                  struct{}{},
+-	{"riscv64", "sync/atomic", "CompareAndSwapUint32"}:                 struct{}{},
+-	{"riscv64", "sync/atomic", "CompareAndSwapUint64"}:                 struct{}{},
+-	{"riscv64", "sync/atomic", "CompareAndSwapUintptr"}:                struct{}{},
+-	{"riscv64", "sync/atomic", "LoadInt32"}:                            struct{}{},
+-	{"riscv64", "sync/atomic", "LoadInt64"}:                            struct{}{},
+-	{"riscv64", "sync/atomic", "LoadPointer"}:                          struct{}{},
+-	{"riscv64", "sync/atomic", "LoadUint32"}:                           struct{}{},
+-	{"riscv64", "sync/atomic", "LoadUint64"}:                           struct{}{},
+-	{"riscv64", "sync/atomic", "LoadUintptr"}:                          struct{}{},
+-	{"riscv64", "sync/atomic", "OrInt32"}:                              struct{}{},
+-	{"riscv64", "sync/atomic", "OrInt64"}:                              struct{}{},
+-	{"riscv64", "sync/atomic", "OrUint32"}:                             struct{}{},
+-	{"riscv64", "sync/atomic", "OrUint64"}:                             struct{}{},
+-	{"riscv64", "sync/atomic", "OrUintptr"}:                            struct{}{},
+-	{"riscv64", "sync/atomic", "StoreInt32"}:                           struct{}{},
+-	{"riscv64", "sync/atomic", "StoreInt64"}:                           struct{}{},
+-	{"riscv64", "sync/atomic", "StoreUint32"}:                          struct{}{},
+-	{"riscv64", "sync/atomic", "StoreUint64"}:                          struct{}{},
+-	{"riscv64", "sync/atomic", "StoreUintptr"}:                         struct{}{},
+-	{"riscv64", "sync/atomic", "SwapInt32"}:                            struct{}{},
+-	{"riscv64", "sync/atomic", "SwapInt64"}:                            struct{}{},
+-	{"riscv64", "sync/atomic", "SwapUint32"}:                           struct{}{},
+-	{"riscv64", "sync/atomic", "SwapUint64"}:                           struct{}{},
+-	{"riscv64", "sync/atomic", "SwapUintptr"}:                          struct{}{},
+-	{"riscv64", "crypto/internal/constanttime", "Select"}:              struct{}{},
+-	{"riscv64", "crypto/internal/constanttime", "boolToUint8"}:         struct{}{},
+-	{"s390x", "internal/runtime/atomic", "And"}:                        struct{}{},
+-	{"s390x", "internal/runtime/atomic", "And8"}:                       struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Cas"}:                        struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Cas64"}:                      struct{}{},
+-	{"s390x", "internal/runtime/atomic", "CasRel"}:                     struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Casint32"}:                   struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Casint64"}:                   struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Casp1"}:                      struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Casuintptr"}:                 struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Load"}:                       struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Load64"}:                     struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Load8"}:                      struct{}{},
+-	{"s390x", "internal/runtime/atomic", "LoadAcq"}:                    struct{}{},
+-	{"s390x", "internal/runtime/atomic", "LoadAcq64"}:                  struct{}{},
+-	{"s390x", "internal/runtime/atomic", "LoadAcquintptr"}:             struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Loadint32"}:                  struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Loadint64"}:                  struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Loadp"}:                      struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Loaduint"}:                   struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Loaduintptr"}:                struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Or"}:                         struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Or8"}:                        struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Store"}:                      struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Store64"}:                    struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Store8"}:                     struct{}{},
+-	{"s390x", "internal/runtime/atomic", "StoreRel"}:                   struct{}{},
+-	{"s390x", "internal/runtime/atomic", "StoreRel64"}:                 struct{}{},
+-	{"s390x", "internal/runtime/atomic", "StoreReluintptr"}:            struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Storeint32"}:                 struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Storeint64"}:                 struct{}{},
+-	{"s390x", "internal/runtime/atomic", "StorepNoWB"}:                 struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Storeuintptr"}:               struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Xadd"}:                       struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Xadd64"}:                     struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Xaddint32"}:                  struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Xaddint64"}:                  struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Xadduintptr"}:                struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Xchg"}:                       struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Xchg64"}:                     struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Xchgint32"}:                  struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Xchgint64"}:                  struct{}{},
+-	{"s390x", "internal/runtime/atomic", "Xchguintptr"}:                struct{}{},
+-	{"s390x", "internal/runtime/math", "Add64"}:                        struct{}{},
+-	{"s390x", "internal/runtime/sys", "Bswap32"}:                       struct{}{},
+-	{"s390x", "internal/runtime/sys", "Bswap64"}:                       struct{}{},
+-	{"s390x", "internal/runtime/sys", "GetCallerPC"}:                   struct{}{},
+-	{"s390x", "internal/runtime/sys", "GetCallerSP"}:                   struct{}{},
+-	{"s390x", "internal/runtime/sys", "GetClosurePtr"}:                 struct{}{},
+-	{"s390x", "internal/runtime/sys", "Len64"}:                         struct{}{},
+-	{"s390x", "internal/runtime/sys", "Len8"}:                          struct{}{},
+-	{"s390x", "internal/runtime/sys", "OnesCount64"}:                   struct{}{},
+-	{"s390x", "internal/runtime/sys", "TrailingZeros32"}:               struct{}{},
+-	{"s390x", "internal/runtime/sys", "TrailingZeros64"}:               struct{}{},
+-	{"s390x", "internal/runtime/sys", "TrailingZeros8"}:                struct{}{},
+-	{"s390x", "math", "Ceil"}:                                          struct{}{},
+-	{"s390x", "math", "FMA"}:                                           struct{}{},
+-	{"s390x", "math", "Floor"}:                                         struct{}{},
+-	{"s390x", "math", "Round"}:                                         struct{}{},
+-	{"s390x", "math", "RoundToEven"}:                                   struct{}{},
+-	{"s390x", "math", "Trunc"}:                                         struct{}{},
+-	{"s390x", "math", "sqrt"}:                                          struct{}{},
+-	{"s390x", "math/big", "mulWW"}:                                     struct{}{},
+-	{"s390x", "math/bits", "Add"}:                                      struct{}{},
+-	{"s390x", "math/bits", "Add64"}:                                    struct{}{},
+-	{"s390x", "math/bits", "Len"}:                                      struct{}{},
+-	{"s390x", "math/bits", "Len16"}:                                    struct{}{},
+-	{"s390x", "math/bits", "Len32"}:                                    struct{}{},
+-	{"s390x", "math/bits", "Len64"}:                                    struct{}{},
+-	{"s390x", "math/bits", "Len8"}:                                     struct{}{},
+-	{"s390x", "math/bits", "Mul"}:                                      struct{}{},
+-	{"s390x", "math/bits", "Mul64"}:                                    struct{}{},
+-	{"s390x", "math/bits", "OnesCount"}:                                struct{}{},
+-	{"s390x", "math/bits", "OnesCount16"}:                              struct{}{},
+-	{"s390x", "math/bits", "OnesCount32"}:                              struct{}{},
+-	{"s390x", "math/bits", "OnesCount64"}:                              struct{}{},
+-	{"s390x", "math/bits", "OnesCount8"}:                               struct{}{},
+-	{"s390x", "math/bits", "ReverseBytes32"}:                           struct{}{},
+-	{"s390x", "math/bits", "ReverseBytes64"}:                           struct{}{},
+-	{"s390x", "math/bits", "RotateLeft"}:                               struct{}{},
+-	{"s390x", "math/bits", "RotateLeft32"}:                             struct{}{},
+-	{"s390x", "math/bits", "RotateLeft64"}:                             struct{}{},
+-	{"s390x", "math/bits", "Sub"}:                                      struct{}{},
+-	{"s390x", "math/bits", "Sub64"}:                                    struct{}{},
+-	{"s390x", "math/bits", "TrailingZeros16"}:                          struct{}{},
+-	{"s390x", "math/bits", "TrailingZeros32"}:                          struct{}{},
+-	{"s390x", "math/bits", "TrailingZeros64"}:                          struct{}{},
+-	{"s390x", "math/bits", "TrailingZeros8"}:                           struct{}{},
+-	{"s390x", "runtime", "KeepAlive"}:                                  struct{}{},
+-	{"s390x", "runtime", "slicebytetostringtmp"}:                       struct{}{},
+-	{"s390x", "sync/atomic", "AddInt32"}:                               struct{}{},
+-	{"s390x", "sync/atomic", "AddInt64"}:                               struct{}{},
+-	{"s390x", "sync/atomic", "AddUint32"}:                              struct{}{},
+-	{"s390x", "sync/atomic", "AddUint64"}:                              struct{}{},
+-	{"s390x", "sync/atomic", "AddUintptr"}:                             struct{}{},
+-	{"s390x", "sync/atomic", "CompareAndSwapInt32"}:                    struct{}{},
+-	{"s390x", "sync/atomic", "CompareAndSwapInt64"}:                    struct{}{},
+-	{"s390x", "sync/atomic", "CompareAndSwapUint32"}:                   struct{}{},
+-	{"s390x", "sync/atomic", "CompareAndSwapUint64"}:                   struct{}{},
+-	{"s390x", "sync/atomic", "CompareAndSwapUintptr"}:                  struct{}{},
+-	{"s390x", "sync/atomic", "LoadInt32"}:                              struct{}{},
+-	{"s390x", "sync/atomic", "LoadInt64"}:                              struct{}{},
+-	{"s390x", "sync/atomic", "LoadPointer"}:                            struct{}{},
+-	{"s390x", "sync/atomic", "LoadUint32"}:                             struct{}{},
+-	{"s390x", "sync/atomic", "LoadUint64"}:                             struct{}{},
+-	{"s390x", "sync/atomic", "LoadUintptr"}:                            struct{}{},
+-	{"s390x", "sync/atomic", "StoreInt32"}:                             struct{}{},
+-	{"s390x", "sync/atomic", "StoreInt64"}:                             struct{}{},
+-	{"s390x", "sync/atomic", "StoreUint32"}:                            struct{}{},
+-	{"s390x", "sync/atomic", "StoreUint64"}:                            struct{}{},
+-	{"s390x", "sync/atomic", "StoreUintptr"}:                           struct{}{},
+-	{"s390x", "sync/atomic", "SwapInt32"}:                              struct{}{},
+-	{"s390x", "sync/atomic", "SwapInt64"}:                              struct{}{},
+-	{"s390x", "sync/atomic", "SwapUint32"}:                             struct{}{},
+-	{"s390x", "sync/atomic", "SwapUint64"}:                             struct{}{},
+-	{"s390x", "sync/atomic", "SwapUintptr"}:                            struct{}{},
+-	{"s390x", "crypto/internal/constanttime", "boolToUint8"}:           struct{}{},
+-	{"wasm", "internal/runtime/sys", "GetCallerPC"}:                    struct{}{},
+-	{"wasm", "internal/runtime/sys", "GetCallerSP"}:                    struct{}{},
+-	{"wasm", "internal/runtime/sys", "GetClosurePtr"}:                  struct{}{},
+-	{"wasm", "internal/runtime/sys", "Len64"}:                          struct{}{},
+-	{"wasm", "internal/runtime/sys", "Len8"}:                           struct{}{},
+-	{"wasm", "internal/runtime/sys", "OnesCount64"}:                    struct{}{},
+-	{"wasm", "internal/runtime/sys", "TrailingZeros32"}:                struct{}{},
+-	{"wasm", "internal/runtime/sys", "TrailingZeros64"}:                struct{}{},
+-	{"wasm", "internal/runtime/sys", "TrailingZeros8"}:                 struct{}{},
+-	{"wasm", "math", "Abs"}:                                            struct{}{},
+-	{"wasm", "math", "Ceil"}:                                           struct{}{},
+-	{"wasm", "math", "Copysign"}:                                       struct{}{},
+-	{"wasm", "math", "Floor"}:                                          struct{}{},
+-	{"wasm", "math", "RoundToEven"}:                                    struct{}{},
+-	{"wasm", "math", "Trunc"}:                                          struct{}{},
+-	{"wasm", "math", "sqrt"}:                                           struct{}{},
+-	{"wasm", "math/big", "mulWW"}:                                      struct{}{},
+-	{"wasm", "math/bits", "Len"}:                                       struct{}{},
+-	{"wasm", "math/bits", "Len16"}:                                     struct{}{},
+-	{"wasm", "math/bits", "Len32"}:                                     struct{}{},
+-	{"wasm", "math/bits", "Len64"}:                                     struct{}{},
+-	{"wasm", "math/bits", "Len8"}:                                      struct{}{},
+-	{"wasm", "math/bits", "Mul"}:                                       struct{}{},
+-	{"wasm", "math/bits", "Mul64"}:                                     struct{}{},
+-	{"wasm", "math/bits", "OnesCount"}:                                 struct{}{},
+-	{"wasm", "math/bits", "OnesCount16"}:                               struct{}{},
+-	{"wasm", "math/bits", "OnesCount32"}:                               struct{}{},
+-	{"wasm", "math/bits", "OnesCount64"}:                               struct{}{},
+-	{"wasm", "math/bits", "OnesCount8"}:                                struct{}{},
+-	{"wasm", "math/bits", "RotateLeft"}:                                struct{}{},
+-	{"wasm", "math/bits", "RotateLeft32"}:                              struct{}{},
+-	{"wasm", "math/bits", "RotateLeft64"}:                              struct{}{},
+-	{"wasm", "math/bits", "TrailingZeros16"}:                           struct{}{},
+-	{"wasm", "math/bits", "TrailingZeros32"}:                           struct{}{},
+-	{"wasm", "math/bits", "TrailingZeros64"}:                           struct{}{},
+-	{"wasm", "math/bits", "TrailingZeros8"}:                            struct{}{},
+-	{"wasm", "runtime", "KeepAlive"}:                                   struct{}{},
+-	{"wasm", "runtime", "slicebytetostringtmp"}:                        struct{}{},
+-	{"wasm", "crypto/internal/constanttime", "Select"}:                 struct{}{},
+-	{"wasm", "crypto/internal/constanttime", "boolToUint8"}:            struct{}{},
++
++	{"ppc", "crypto/internal/constanttime", "boolToUint8"}:     struct{}{},
++	{"ppc", "internal/runtime/atomic", "And"}:                  struct{}{},
++	{"ppc", "internal/runtime/atomic", "Cas"}:                  struct{}{},
++	{"ppc", "internal/runtime/atomic", "CasRel"}:               struct{}{},
++	{"ppc", "internal/runtime/atomic", "Casint32"}:             struct{}{},
++	{"ppc", "internal/runtime/atomic", "Casp1"}:                struct{}{},
++	{"ppc", "internal/runtime/atomic", "Casuintptr"}:           struct{}{},
++	{"ppc", "internal/runtime/atomic", "Load"}:                 struct{}{},
++	{"ppc", "internal/runtime/atomic", "Load8"}:                struct{}{},
++	{"ppc", "internal/runtime/atomic", "LoadAcq"}:              struct{}{},
++	{"ppc", "internal/runtime/atomic", "LoadAcquintptr"}:       struct{}{},
++	{"ppc", "internal/runtime/atomic", "Loadint32"}:            struct{}{},
++	{"ppc", "internal/runtime/atomic", "Loadp"}:                struct{}{},
++	{"ppc", "internal/runtime/atomic", "Loaduint"}:             struct{}{},
++	{"ppc", "internal/runtime/atomic", "Loaduintptr"}:          struct{}{},
++	{"ppc", "internal/runtime/atomic", "Or"}:                   struct{}{},
++	{"ppc", "internal/runtime/atomic", "Store"}:                struct{}{},
++	{"ppc", "internal/runtime/atomic", "Store8"}:               struct{}{},
++	{"ppc", "internal/runtime/atomic", "StoreRel"}:             struct{}{},
++	{"ppc", "internal/runtime/atomic", "StoreReluintptr"}:      struct{}{},
++	{"ppc", "internal/runtime/atomic", "Storeint32"}:           struct{}{},
++	{"ppc", "internal/runtime/atomic", "StorepNoWB"}:           struct{}{},
++	{"ppc", "internal/runtime/atomic", "Storeuintptr"}:         struct{}{},
++	{"ppc", "internal/runtime/atomic", "Xadd"}:                 struct{}{},
++	{"ppc", "internal/runtime/atomic", "Xaddint32"}:            struct{}{},
++	{"ppc", "internal/runtime/atomic", "Xadduintptr"}:          struct{}{},
++	{"ppc", "internal/runtime/atomic", "Xchg"}:                 struct{}{},
++	{"ppc", "internal/runtime/atomic", "Xchgint32"}:            struct{}{},
++	{"ppc", "internal/runtime/atomic", "Xchguintptr"}:          struct{}{},
++	{"ppc", "internal/runtime/sys", "GetCallerPC"}:             struct{}{},
++	{"ppc", "internal/runtime/sys", "GetCallerSP"}:             struct{}{},
++	{"ppc", "internal/runtime/sys", "GetClosurePtr"}:           struct{}{},
++	{"ppc", "internal/runtime/sys", "Len8"}:                    struct{}{},
++	{"ppc", "internal/runtime/sys", "TrailingZeros32"}:         struct{}{},
++	{"ppc", "internal/runtime/sys", "TrailingZeros8"}:          struct{}{},
++	{"ppc", "math", "Abs"}:                                     struct{}{},
++	{"ppc", "math", "FMA"}:                                     struct{}{},
++	{"ppc", "math/bits", "Len"}:                                struct{}{},
++	{"ppc", "math/bits", "Len16"}:                              struct{}{},
++	{"ppc", "math/bits", "Len32"}:                              struct{}{},
++	{"ppc", "math/bits", "Len8"}:                               struct{}{},
++	{"ppc", "math/bits", "Mul64"}:                              struct{}{},
++	{"ppc", "math/bits", "RotateLeft32"}:                       struct{}{},
++	{"ppc", "math/bits", "TrailingZeros16"}:                    struct{}{},
++	{"ppc", "math/bits", "TrailingZeros32"}:                    struct{}{},
++	{"ppc", "math/bits", "TrailingZeros8"}:                     struct{}{},
++	{"ppc", "runtime", "KeepAlive"}:                            struct{}{},
++	{"ppc", "runtime", "publicationBarrier"}:                   struct{}{},
++	{"ppc", "runtime", "slicebytetostringtmp"}:                 struct{}{},
++	{"ppc", "sync/atomic", "AddInt32"}:                         struct{}{},
++	{"ppc", "sync/atomic", "AddUint32"}:                        struct{}{},
++	{"ppc", "sync/atomic", "AddUintptr"}:                       struct{}{},
++	{"ppc", "sync/atomic", "CompareAndSwapInt32"}:              struct{}{},
++	{"ppc", "sync/atomic", "CompareAndSwapUint32"}:             struct{}{},
++	{"ppc", "sync/atomic", "CompareAndSwapUintptr"}:            struct{}{},
++	{"ppc", "sync/atomic", "LoadInt32"}:                        struct{}{},
++	{"ppc", "sync/atomic", "LoadPointer"}:                      struct{}{},
++	{"ppc", "sync/atomic", "LoadUint32"}:                       struct{}{},
++	{"ppc", "sync/atomic", "LoadUintptr"}:                      struct{}{},
++	{"ppc", "sync/atomic", "StoreInt32"}:                       struct{}{},
++	{"ppc", "sync/atomic", "StoreUint32"}:                      struct{}{},
++	{"ppc", "sync/atomic", "StoreUintptr"}:                     struct{}{},
++	{"ppc", "sync/atomic", "SwapInt32"}:                        struct{}{},
++	{"ppc", "sync/atomic", "SwapUint32"}:                       struct{}{},
++	{"ppc", "sync/atomic", "SwapUintptr"}:                      struct{}{},
++	{"ppc64", "internal/runtime/atomic", "And"}:                struct{}{},
++	{"ppc64", "internal/runtime/atomic", "And8"}:               struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Cas"}:                struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Cas64"}:              struct{}{},
++	{"ppc64", "internal/runtime/atomic", "CasRel"}:             struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Casint32"}:           struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Casint64"}:           struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Casp1"}:              struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Casuintptr"}:         struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Load"}:               struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Load64"}:             struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Load8"}:              struct{}{},
++	{"ppc64", "internal/runtime/atomic", "LoadAcq"}:            struct{}{},
++	{"ppc64", "internal/runtime/atomic", "LoadAcq64"}:          struct{}{},
++	{"ppc64", "internal/runtime/atomic", "LoadAcquintptr"}:     struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Loadint32"}:          struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Loadint64"}:          struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Loadp"}:              struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Loaduint"}:           struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Loaduintptr"}:        struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Or"}:                 struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Or8"}:                struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Store"}:              struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Store64"}:            struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Store8"}:             struct{}{},
++	{"ppc64", "internal/runtime/atomic", "StoreRel"}:           struct{}{},
++	{"ppc64", "internal/runtime/atomic", "StoreRel64"}:         struct{}{},
++	{"ppc64", "internal/runtime/atomic", "StoreReluintptr"}:    struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Storeint32"}:         struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Storeint64"}:         struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Storeuintptr"}:       struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Xadd"}:               struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Xadd64"}:             struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Xaddint32"}:          struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Xaddint64"}:          struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Xadduintptr"}:        struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Xchg8"}:              struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Xchg"}:               struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Xchg64"}:             struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Xchgint32"}:          struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Xchgint64"}:          struct{}{},
++	{"ppc64", "internal/runtime/atomic", "Xchguintptr"}:        struct{}{},
++	{"ppc64", "internal/runtime/math", "Add64"}:                struct{}{},
++	{"ppc64", "internal/runtime/math", "MulUintptr"}:           struct{}{},
++	{"ppc64", "internal/runtime/sys", "Bswap32"}:               struct{}{},
++	{"ppc64", "internal/runtime/sys", "Bswap64"}:               struct{}{},
++	{"ppc64", "internal/runtime/sys", "GetCallerPC"}:           struct{}{},
++	{"ppc64", "internal/runtime/sys", "GetCallerSP"}:           struct{}{},
++	{"ppc64", "internal/runtime/sys", "GetClosurePtr"}:         struct{}{},
++	{"ppc64", "internal/runtime/sys", "Len64"}:                 struct{}{},
++	{"ppc64", "internal/runtime/sys", "Len8"}:                  struct{}{},
++	{"ppc64", "internal/runtime/sys", "OnesCount64"}:           struct{}{},
++	{"ppc64", "internal/runtime/sys", "Prefetch"}:              struct{}{},
++	{"ppc64", "internal/runtime/sys", "PrefetchStreamed"}:      struct{}{},
++	{"ppc64", "internal/runtime/sys", "TrailingZeros8"}:        struct{}{},
++	{"ppc64", "internal/runtime/sys", "TrailingZeros32"}:       struct{}{},
++	{"ppc64", "internal/runtime/sys", "TrailingZeros64"}:       struct{}{},
++	{"ppc64", "math", "Abs"}:                                   struct{}{},
++	{"ppc64", "math", "Ceil"}:                                  struct{}{},
++	{"ppc64", "math", "Copysign"}:                              struct{}{},
++	{"ppc64", "math", "FMA"}:                                   struct{}{},
++	{"ppc64", "math", "Floor"}:                                 struct{}{},
++	{"ppc64", "math", "Round"}:                                 struct{}{},
++	{"ppc64", "math", "Trunc"}:                                 struct{}{},
++	{"ppc64", "math", "sqrt"}:                                  struct{}{},
++	{"ppc64", "math/big", "mulWW"}:                             struct{}{},
++	{"ppc64", "math/bits", "Add"}:                              struct{}{},
++	{"ppc64", "math/bits", "Add64"}:                            struct{}{},
++	{"ppc64", "math/bits", "Len"}:                              struct{}{},
++	{"ppc64", "math/bits", "Len16"}:                            struct{}{},
++	{"ppc64", "math/bits", "Len32"}:                            struct{}{},
++	{"ppc64", "math/bits", "Len64"}:                            struct{}{},
++	{"ppc64", "math/bits", "Len8"}:                             struct{}{},
++	{"ppc64", "math/bits", "Mul"}:                              struct{}{},
++	{"ppc64", "math/bits", "Mul64"}:                            struct{}{},
++	{"ppc64", "math/bits", "OnesCount"}:                        struct{}{},
++	{"ppc64", "math/bits", "OnesCount16"}:                      struct{}{},
++	{"ppc64", "math/bits", "OnesCount32"}:                      struct{}{},
++	{"ppc64", "math/bits", "OnesCount64"}:                      struct{}{},
++	{"ppc64", "math/bits", "OnesCount8"}:                       struct{}{},
++	{"ppc64", "math/bits", "ReverseBytes16"}:                   struct{}{},
++	{"ppc64", "math/bits", "ReverseBytes32"}:                   struct{}{},
++	{"ppc64", "math/bits", "ReverseBytes64"}:                   struct{}{},
++	{"ppc64", "math/bits", "RotateLeft"}:                       struct{}{},
++	{"ppc64", "math/bits", "RotateLeft32"}:                     struct{}{},
++	{"ppc64", "math/bits", "RotateLeft64"}:                     struct{}{},
++	{"ppc64", "math/bits", "Sub"}:                              struct{}{},
++	{"ppc64", "math/bits", "Sub64"}:                            struct{}{},
++	{"ppc64", "math/bits", "TrailingZeros8"}:                   struct{}{},
++	{"ppc64", "math/bits", "TrailingZeros16"}:                  struct{}{},
++	{"ppc64", "math/bits", "TrailingZeros32"}:                  struct{}{},
++	{"ppc64", "math/bits", "TrailingZeros64"}:                  struct{}{},
++	{"ppc64", "runtime", "KeepAlive"}:                          struct{}{},
++	{"ppc64", "runtime", "publicationBarrier"}:                 struct{}{},
++	{"ppc64", "runtime", "slicebytetostringtmp"}:               struct{}{},
++	{"ppc64", "sync/atomic", "AddInt32"}:                       struct{}{},
++	{"ppc64", "sync/atomic", "AddInt64"}:                       struct{}{},
++	{"ppc64", "sync/atomic", "AddUint32"}:                      struct{}{},
++	{"ppc64", "sync/atomic", "AddUint64"}:                      struct{}{},
++	{"ppc64", "sync/atomic", "AddUintptr"}:                     struct{}{},
++	{"ppc64", "sync/atomic", "CompareAndSwapInt32"}:            struct{}{},
++	{"ppc64", "sync/atomic", "CompareAndSwapInt64"}:            struct{}{},
++	{"ppc64", "sync/atomic", "CompareAndSwapUint32"}:           struct{}{},
++	{"ppc64", "sync/atomic", "CompareAndSwapUint64"}:           struct{}{},
++	{"ppc64", "sync/atomic", "CompareAndSwapUintptr"}:          struct{}{},
++	{"ppc64", "sync/atomic", "LoadInt32"}:                      struct{}{},
++	{"ppc64", "sync/atomic", "LoadInt64"}:                      struct{}{},
++	{"ppc64", "sync/atomic", "LoadPointer"}:                    struct{}{},
++	{"ppc64", "sync/atomic", "LoadUint32"}:                     struct{}{},
++	{"ppc64", "sync/atomic", "LoadUint64"}:                     struct{}{},
++	{"ppc64", "sync/atomic", "LoadUintptr"}:                    struct{}{},
++	{"ppc64", "sync/atomic", "StoreInt32"}:                     struct{}{},
++	{"ppc64", "sync/atomic", "StoreInt64"}:                     struct{}{},
++	{"ppc64", "sync/atomic", "StoreUint32"}:                    struct{}{},
++	{"ppc64", "sync/atomic", "StoreUint64"}:                    struct{}{},
++	{"ppc64", "sync/atomic", "StoreUintptr"}:                   struct{}{},
++	{"ppc64", "sync/atomic", "SwapInt32"}:                      struct{}{},
++	{"ppc64", "sync/atomic", "SwapInt64"}:                      struct{}{},
++	{"ppc64", "sync/atomic", "SwapUint32"}:                     struct{}{},
++	{"ppc64", "sync/atomic", "SwapUint64"}:                     struct{}{},
++	{"ppc64", "sync/atomic", "SwapUintptr"}:                    struct{}{},
++	{"ppc64", "crypto/internal/constanttime", "Select"}:        struct{}{},
++	{"ppc64", "crypto/internal/constanttime", "boolToUint8"}:   struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "And"}:              struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "And8"}:             struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Cas"}:              struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Cas64"}:            struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "CasRel"}:           struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Casint32"}:         struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Casint64"}:         struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Casp1"}:            struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Casuintptr"}:       struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Load"}:             struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Load64"}:           struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Load8"}:            struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "LoadAcq"}:          struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "LoadAcq64"}:        struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "LoadAcquintptr"}:   struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Loadint32"}:        struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Loadint64"}:        struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Loadp"}:            struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Loaduint"}:         struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Loaduintptr"}:      struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Or"}:               struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Or8"}:              struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Store"}:            struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Store64"}:          struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Store8"}:           struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "StoreRel"}:         struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "StoreRel64"}:       struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "StoreReluintptr"}:  struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Storeint32"}:       struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Storeint64"}:       struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Storeuintptr"}:     struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Xadd"}:             struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Xadd64"}:           struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Xaddint32"}:        struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Xaddint64"}:        struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Xadduintptr"}:      struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Xchg8"}:            struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Xchg"}:             struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Xchg64"}:           struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Xchgint32"}:        struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Xchgint64"}:        struct{}{},
++	{"ppc64le", "internal/runtime/atomic", "Xchguintptr"}:      struct{}{},
++	{"ppc64le", "internal/runtime/math", "Add64"}:              struct{}{},
++	{"ppc64le", "internal/runtime/math", "MulUintptr"}:         struct{}{},
++	{"ppc64le", "internal/runtime/sys", "Bswap32"}:             struct{}{},
++	{"ppc64le", "internal/runtime/sys", "Bswap64"}:             struct{}{},
++	{"ppc64le", "internal/runtime/sys", "GetCallerPC"}:         struct{}{},
++	{"ppc64le", "internal/runtime/sys", "GetCallerSP"}:         struct{}{},
++	{"ppc64le", "internal/runtime/sys", "GetClosurePtr"}:       struct{}{},
++	{"ppc64le", "internal/runtime/sys", "Len64"}:               struct{}{},
++	{"ppc64le", "internal/runtime/sys", "Len8"}:                struct{}{},
++	{"ppc64le", "internal/runtime/sys", "OnesCount64"}:         struct{}{},
++	{"ppc64le", "internal/runtime/sys", "Prefetch"}:            struct{}{},
++	{"ppc64le", "internal/runtime/sys", "PrefetchStreamed"}:    struct{}{},
++	{"ppc64le", "internal/runtime/sys", "TrailingZeros8"}:      struct{}{},
++	{"ppc64le", "internal/runtime/sys", "TrailingZeros32"}:     struct{}{},
++	{"ppc64le", "internal/runtime/sys", "TrailingZeros64"}:     struct{}{},
++	{"ppc64le", "math", "Abs"}:                                 struct{}{},
++	{"ppc64le", "math", "Ceil"}:                                struct{}{},
++	{"ppc64le", "math", "Copysign"}:                            struct{}{},
++	{"ppc64le", "math", "FMA"}:                                 struct{}{},
++	{"ppc64le", "math", "Floor"}:                               struct{}{},
++	{"ppc64le", "math", "Round"}:                               struct{}{},
++	{"ppc64le", "math", "Trunc"}:                               struct{}{},
++	{"ppc64le", "math", "sqrt"}:                                struct{}{},
++	{"ppc64le", "math/big", "mulWW"}:                           struct{}{},
++	{"ppc64le", "math/bits", "Add"}:                            struct{}{},
++	{"ppc64le", "math/bits", "Add64"}:                          struct{}{},
++	{"ppc64le", "math/bits", "Len"}:                            struct{}{},
++	{"ppc64le", "math/bits", "Len16"}:                          struct{}{},
++	{"ppc64le", "math/bits", "Len32"}:                          struct{}{},
++	{"ppc64le", "math/bits", "Len64"}:                          struct{}{},
++	{"ppc64le", "math/bits", "Len8"}:                           struct{}{},
++	{"ppc64le", "math/bits", "Mul"}:                            struct{}{},
++	{"ppc64le", "math/bits", "Mul64"}:                          struct{}{},
++	{"ppc64le", "math/bits", "OnesCount"}:                      struct{}{},
++	{"ppc64le", "math/bits", "OnesCount16"}:                    struct{}{},
++	{"ppc64le", "math/bits", "OnesCount32"}:                    struct{}{},
++	{"ppc64le", "math/bits", "OnesCount64"}:                    struct{}{},
++	{"ppc64le", "math/bits", "OnesCount8"}:                     struct{}{},
++	{"ppc64le", "math/bits", "ReverseBytes16"}:                 struct{}{},
++	{"ppc64le", "math/bits", "ReverseBytes32"}:                 struct{}{},
++	{"ppc64le", "math/bits", "ReverseBytes64"}:                 struct{}{},
++	{"ppc64le", "math/bits", "RotateLeft"}:                     struct{}{},
++	{"ppc64le", "math/bits", "RotateLeft32"}:                   struct{}{},
++	{"ppc64le", "math/bits", "RotateLeft64"}:                   struct{}{},
++	{"ppc64le", "math/bits", "Sub"}:                            struct{}{},
++	{"ppc64le", "math/bits", "Sub64"}:                          struct{}{},
++	{"ppc64le", "math/bits", "TrailingZeros8"}:                 struct{}{},
++	{"ppc64le", "math/bits", "TrailingZeros16"}:                struct{}{},
++	{"ppc64le", "math/bits", "TrailingZeros32"}:                struct{}{},
++	{"ppc64le", "math/bits", "TrailingZeros64"}:                struct{}{},
++	{"ppc64le", "runtime", "KeepAlive"}:                        struct{}{},
++	{"ppc64le", "runtime", "publicationBarrier"}:               struct{}{},
++	{"ppc64le", "runtime", "slicebytetostringtmp"}:             struct{}{},
++	{"ppc64le", "sync/atomic", "AddInt32"}:                     struct{}{},
++	{"ppc64le", "sync/atomic", "AddInt64"}:                     struct{}{},
++	{"ppc64le", "sync/atomic", "AddUint32"}:                    struct{}{},
++	{"ppc64le", "sync/atomic", "AddUint64"}:                    struct{}{},
++	{"ppc64le", "sync/atomic", "AddUintptr"}:                   struct{}{},
++	{"ppc64le", "sync/atomic", "CompareAndSwapInt32"}:          struct{}{},
++	{"ppc64le", "sync/atomic", "CompareAndSwapInt64"}:          struct{}{},
++	{"ppc64le", "sync/atomic", "CompareAndSwapUint32"}:         struct{}{},
++	{"ppc64le", "sync/atomic", "CompareAndSwapUint64"}:         struct{}{},
++	{"ppc64le", "sync/atomic", "CompareAndSwapUintptr"}:        struct{}{},
++	{"ppc64le", "sync/atomic", "LoadInt32"}:                    struct{}{},
++	{"ppc64le", "sync/atomic", "LoadInt64"}:                    struct{}{},
++	{"ppc64le", "sync/atomic", "LoadPointer"}:                  struct{}{},
++	{"ppc64le", "sync/atomic", "LoadUint32"}:                   struct{}{},
++	{"ppc64le", "sync/atomic", "LoadUint64"}:                   struct{}{},
++	{"ppc64le", "sync/atomic", "LoadUintptr"}:                  struct{}{},
++	{"ppc64le", "sync/atomic", "StoreInt32"}:                   struct{}{},
++	{"ppc64le", "sync/atomic", "StoreInt64"}:                   struct{}{},
++	{"ppc64le", "sync/atomic", "StoreUint32"}:                  struct{}{},
++	{"ppc64le", "sync/atomic", "StoreUint64"}:                  struct{}{},
++	{"ppc64le", "sync/atomic", "StoreUintptr"}:                 struct{}{},
++	{"ppc64le", "sync/atomic", "SwapInt32"}:                    struct{}{},
++	{"ppc64le", "sync/atomic", "SwapInt64"}:                    struct{}{},
++	{"ppc64le", "sync/atomic", "SwapUint32"}:                   struct{}{},
++	{"ppc64le", "sync/atomic", "SwapUint64"}:                   struct{}{},
++	{"ppc64le", "sync/atomic", "SwapUintptr"}:                  struct{}{},
++	{"ppc64le", "crypto/internal/constanttime", "Select"}:      struct{}{},
++	{"ppc64le", "crypto/internal/constanttime", "boolToUint8"}: struct{}{},
++	{"riscv64", "internal/runtime/atomic", "And"}:              struct{}{},
++	{"riscv64", "internal/runtime/atomic", "And32"}:            struct{}{},
++	{"riscv64", "internal/runtime/atomic", "And64"}:            struct{}{},
++	{"riscv64", "internal/runtime/atomic", "And8"}:             struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Cas"}:              struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Cas64"}:            struct{}{},
++	{"riscv64", "internal/runtime/atomic", "CasRel"}:           struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Casint32"}:         struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Casint64"}:         struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Casp1"}:            struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Casuintptr"}:       struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Load"}:             struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Load64"}:           struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Load8"}:            struct{}{},
++	{"riscv64", "internal/runtime/atomic", "LoadAcq"}:          struct{}{},
++	{"riscv64", "internal/runtime/atomic", "LoadAcq64"}:        struct{}{},
++	{"riscv64", "internal/runtime/atomic", "LoadAcquintptr"}:   struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Loadint32"}:        struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Loadint64"}:        struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Loadp"}:            struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Loaduint"}:         struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Loaduintptr"}:      struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Or"}:               struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Or32"}:             struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Or64"}:             struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Or8"}:              struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Store"}:            struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Store64"}:          struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Store8"}:           struct{}{},
++	{"riscv64", "internal/runtime/atomic", "StoreRel"}:         struct{}{},
++	{"riscv64", "internal/runtime/atomic", "StoreRel64"}:       struct{}{},
++	{"riscv64", "internal/runtime/atomic", "StoreReluintptr"}:  struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Storeint32"}:       struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Storeint64"}:       struct{}{},
++	{"riscv64", "internal/runtime/atomic", "StorepNoWB"}:       struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Storeuintptr"}:     struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Xadd"}:             struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Xadd64"}:           struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Xaddint32"}:        struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Xaddint64"}:        struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Xadduintptr"}:      struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Xchg"}:             struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Xchg64"}:           struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Xchgint32"}:        struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Xchgint64"}:        struct{}{},
++	{"riscv64", "internal/runtime/atomic", "Xchguintptr"}:      struct{}{},
++	{"riscv64", "internal/runtime/math", "Add64"}:              struct{}{},
++	{"riscv64", "internal/runtime/math", "MulUintptr"}:         struct{}{},
++	{"riscv64", "internal/runtime/sys", "Bswap32"}:             struct{}{},
++	{"riscv64", "internal/runtime/sys", "Bswap64"}:             struct{}{},
++	{"riscv64", "internal/runtime/sys", "GetCallerPC"}:         struct{}{},
++	{"riscv64", "internal/runtime/sys", "GetCallerSP"}:         struct{}{},
++	{"riscv64", "internal/runtime/sys", "GetClosurePtr"}:       struct{}{},
++	{"riscv64", "internal/runtime/sys", "Len64"}:               struct{}{},
++	{"riscv64", "internal/runtime/sys", "Len8"}:                struct{}{},
++	{"riscv64", "internal/runtime/sys", "OnesCount64"}:         struct{}{},
++	{"riscv64", "internal/runtime/sys", "TrailingZeros32"}:     struct{}{},
++	{"riscv64", "internal/runtime/sys", "TrailingZeros64"}:     struct{}{},
++	{"riscv64", "internal/runtime/sys", "TrailingZeros8"}:      struct{}{},
++	{"riscv64", "math", "Abs"}:                                 struct{}{},
++	{"riscv64", "math", "Copysign"}:                            struct{}{},
++	{"riscv64", "math", "FMA"}:                                 struct{}{},
++	{"riscv64", "math", "sqrt"}:                                struct{}{},
++	{"riscv64", "math/big", "mulWW"}:                           struct{}{},
++	{"riscv64", "math/bits", "Add"}:                            struct{}{},
++	{"riscv64", "math/bits", "Add64"}:                          struct{}{},
++	{"riscv64", "math/bits", "Len"}:                            struct{}{},
++	{"riscv64", "math/bits", "Len16"}:                          struct{}{},
++	{"riscv64", "math/bits", "Len32"}:                          struct{}{},
++	{"riscv64", "math/bits", "Len64"}:                          struct{}{},
++	{"riscv64", "math/bits", "Len8"}:                           struct{}{},
++	{"riscv64", "math/bits", "Mul"}:                            struct{}{},
++	{"riscv64", "math/bits", "Mul64"}:                          struct{}{},
++	{"riscv64", "math/bits", "OnesCount"}:                      struct{}{},
++	{"riscv64", "math/bits", "OnesCount16"}:                    struct{}{},
++	{"riscv64", "math/bits", "OnesCount32"}:                    struct{}{},
++	{"riscv64", "math/bits", "OnesCount64"}:                    struct{}{},
++	{"riscv64", "math/bits", "OnesCount8"}:                     struct{}{},
++	{"riscv64", "math/bits", "ReverseBytes16"}:                 struct{}{},
++	{"riscv64", "math/bits", "ReverseBytes32"}:                 struct{}{},
++	{"riscv64", "math/bits", "ReverseBytes64"}:                 struct{}{},
++	{"riscv64", "math/bits", "RotateLeft"}:                     struct{}{},
++	{"riscv64", "math/bits", "RotateLeft16"}:                   struct{}{},
++	{"riscv64", "math/bits", "RotateLeft32"}:                   struct{}{},
++	{"riscv64", "math/bits", "RotateLeft64"}:                   struct{}{},
++	{"riscv64", "math/bits", "RotateLeft8"}:                    struct{}{},
++	{"riscv64", "math/bits", "Sub"}:                            struct{}{},
++	{"riscv64", "math/bits", "Sub64"}:                          struct{}{},
++	{"riscv64", "math/bits", "TrailingZeros16"}:                struct{}{},
++	{"riscv64", "math/bits", "TrailingZeros32"}:                struct{}{},
++	{"riscv64", "math/bits", "TrailingZeros64"}:                struct{}{},
++	{"riscv64", "math/bits", "TrailingZeros8"}:                 struct{}{},
++	{"riscv64", "runtime", "KeepAlive"}:                        struct{}{},
++	{"riscv64", "runtime", "publicationBarrier"}:               struct{}{},
++	{"riscv64", "runtime", "slicebytetostringtmp"}:             struct{}{},
++	{"riscv64", "sync/atomic", "AddInt32"}:                     struct{}{},
++	{"riscv64", "sync/atomic", "AddInt64"}:                     struct{}{},
++	{"riscv64", "sync/atomic", "AddUint32"}:                    struct{}{},
++	{"riscv64", "sync/atomic", "AddUint64"}:                    struct{}{},
++	{"riscv64", "sync/atomic", "AddUintptr"}:                   struct{}{},
++	{"riscv64", "sync/atomic", "AndInt32"}:                     struct{}{},
++	{"riscv64", "sync/atomic", "AndInt64"}:                     struct{}{},
++	{"riscv64", "sync/atomic", "AndUint32"}:                    struct{}{},
++	{"riscv64", "sync/atomic", "AndUint64"}:                    struct{}{},
++	{"riscv64", "sync/atomic", "AndUintptr"}:                   struct{}{},
++	{"riscv64", "sync/atomic", "CompareAndSwapInt32"}:          struct{}{},
++	{"riscv64", "sync/atomic", "CompareAndSwapInt64"}:          struct{}{},
++	{"riscv64", "sync/atomic", "CompareAndSwapUint32"}:         struct{}{},
++	{"riscv64", "sync/atomic", "CompareAndSwapUint64"}:         struct{}{},
++	{"riscv64", "sync/atomic", "CompareAndSwapUintptr"}:        struct{}{},
++	{"riscv64", "sync/atomic", "LoadInt32"}:                    struct{}{},
++	{"riscv64", "sync/atomic", "LoadInt64"}:                    struct{}{},
++	{"riscv64", "sync/atomic", "LoadPointer"}:                  struct{}{},
++	{"riscv64", "sync/atomic", "LoadUint32"}:                   struct{}{},
++	{"riscv64", "sync/atomic", "LoadUint64"}:                   struct{}{},
++	{"riscv64", "sync/atomic", "LoadUintptr"}:                  struct{}{},
++	{"riscv64", "sync/atomic", "OrInt32"}:                      struct{}{},
++	{"riscv64", "sync/atomic", "OrInt64"}:                      struct{}{},
++	{"riscv64", "sync/atomic", "OrUint32"}:                     struct{}{},
++	{"riscv64", "sync/atomic", "OrUint64"}:                     struct{}{},
++	{"riscv64", "sync/atomic", "OrUintptr"}:                    struct{}{},
++	{"riscv64", "sync/atomic", "StoreInt32"}:                   struct{}{},
++	{"riscv64", "sync/atomic", "StoreInt64"}:                   struct{}{},
++	{"riscv64", "sync/atomic", "StoreUint32"}:                  struct{}{},
++	{"riscv64", "sync/atomic", "StoreUint64"}:                  struct{}{},
++	{"riscv64", "sync/atomic", "StoreUintptr"}:                 struct{}{},
++	{"riscv64", "sync/atomic", "SwapInt32"}:                    struct{}{},
++	{"riscv64", "sync/atomic", "SwapInt64"}:                    struct{}{},
++	{"riscv64", "sync/atomic", "SwapUint32"}:                   struct{}{},
++	{"riscv64", "sync/atomic", "SwapUint64"}:                   struct{}{},
++	{"riscv64", "sync/atomic", "SwapUintptr"}:                  struct{}{},
++	{"riscv64", "crypto/internal/constanttime", "Select"}:      struct{}{},
++	{"riscv64", "crypto/internal/constanttime", "boolToUint8"}: struct{}{},
++	{"s390x", "internal/runtime/atomic", "And"}:                struct{}{},
++	{"s390x", "internal/runtime/atomic", "And8"}:               struct{}{},
++	{"s390x", "internal/runtime/atomic", "Cas"}:                struct{}{},
++	{"s390x", "internal/runtime/atomic", "Cas64"}:              struct{}{},
++	{"s390x", "internal/runtime/atomic", "CasRel"}:             struct{}{},
++	{"s390x", "internal/runtime/atomic", "Casint32"}:           struct{}{},
++	{"s390x", "internal/runtime/atomic", "Casint64"}:           struct{}{},
++	{"s390x", "internal/runtime/atomic", "Casp1"}:              struct{}{},
++	{"s390x", "internal/runtime/atomic", "Casuintptr"}:         struct{}{},
++	{"s390x", "internal/runtime/atomic", "Load"}:               struct{}{},
++	{"s390x", "internal/runtime/atomic", "Load64"}:             struct{}{},
++	{"s390x", "internal/runtime/atomic", "Load8"}:              struct{}{},
++	{"s390x", "internal/runtime/atomic", "LoadAcq"}:            struct{}{},
++	{"s390x", "internal/runtime/atomic", "LoadAcq64"}:          struct{}{},
++	{"s390x", "internal/runtime/atomic", "LoadAcquintptr"}:     struct{}{},
++	{"s390x", "internal/runtime/atomic", "Loadint32"}:          struct{}{},
++	{"s390x", "internal/runtime/atomic", "Loadint64"}:          struct{}{},
++	{"s390x", "internal/runtime/atomic", "Loadp"}:              struct{}{},
++	{"s390x", "internal/runtime/atomic", "Loaduint"}:           struct{}{},
++	{"s390x", "internal/runtime/atomic", "Loaduintptr"}:        struct{}{},
++	{"s390x", "internal/runtime/atomic", "Or"}:                 struct{}{},
++	{"s390x", "internal/runtime/atomic", "Or8"}:                struct{}{},
++	{"s390x", "internal/runtime/atomic", "Store"}:              struct{}{},
++	{"s390x", "internal/runtime/atomic", "Store64"}:            struct{}{},
++	{"s390x", "internal/runtime/atomic", "Store8"}:             struct{}{},
++	{"s390x", "internal/runtime/atomic", "StoreRel"}:           struct{}{},
++	{"s390x", "internal/runtime/atomic", "StoreRel64"}:         struct{}{},
++	{"s390x", "internal/runtime/atomic", "StoreReluintptr"}:    struct{}{},
++	{"s390x", "internal/runtime/atomic", "Storeint32"}:         struct{}{},
++	{"s390x", "internal/runtime/atomic", "Storeint64"}:         struct{}{},
++	{"s390x", "internal/runtime/atomic", "StorepNoWB"}:         struct{}{},
++	{"s390x", "internal/runtime/atomic", "Storeuintptr"}:       struct{}{},
++	{"s390x", "internal/runtime/atomic", "Xadd"}:               struct{}{},
++	{"s390x", "internal/runtime/atomic", "Xadd64"}:             struct{}{},
++	{"s390x", "internal/runtime/atomic", "Xaddint32"}:          struct{}{},
++	{"s390x", "internal/runtime/atomic", "Xaddint64"}:          struct{}{},
++	{"s390x", "internal/runtime/atomic", "Xadduintptr"}:        struct{}{},
++	{"s390x", "internal/runtime/atomic", "Xchg"}:               struct{}{},
++	{"s390x", "internal/runtime/atomic", "Xchg64"}:             struct{}{},
++	{"s390x", "internal/runtime/atomic", "Xchgint32"}:          struct{}{},
++	{"s390x", "internal/runtime/atomic", "Xchgint64"}:          struct{}{},
++	{"s390x", "internal/runtime/atomic", "Xchguintptr"}:        struct{}{},
++	{"s390x", "internal/runtime/math", "Add64"}:                struct{}{},
++	{"s390x", "internal/runtime/sys", "Bswap32"}:               struct{}{},
++	{"s390x", "internal/runtime/sys", "Bswap64"}:               struct{}{},
++	{"s390x", "internal/runtime/sys", "GetCallerPC"}:           struct{}{},
++	{"s390x", "internal/runtime/sys", "GetCallerSP"}:           struct{}{},
++	{"s390x", "internal/runtime/sys", "GetClosurePtr"}:         struct{}{},
++	{"s390x", "internal/runtime/sys", "Len64"}:                 struct{}{},
++	{"s390x", "internal/runtime/sys", "Len8"}:                  struct{}{},
++	{"s390x", "internal/runtime/sys", "OnesCount64"}:           struct{}{},
++	{"s390x", "internal/runtime/sys", "TrailingZeros32"}:       struct{}{},
++	{"s390x", "internal/runtime/sys", "TrailingZeros64"}:       struct{}{},
++	{"s390x", "internal/runtime/sys", "TrailingZeros8"}:        struct{}{},
++	{"s390x", "math", "Ceil"}:                                  struct{}{},
++	{"s390x", "math", "FMA"}:                                   struct{}{},
++	{"s390x", "math", "Floor"}:                                 struct{}{},
++	{"s390x", "math", "Round"}:                                 struct{}{},
++	{"s390x", "math", "RoundToEven"}:                           struct{}{},
++	{"s390x", "math", "Trunc"}:                                 struct{}{},
++	{"s390x", "math", "sqrt"}:                                  struct{}{},
++	{"s390x", "math/big", "mulWW"}:                             struct{}{},
++	{"s390x", "math/bits", "Add"}:                              struct{}{},
++	{"s390x", "math/bits", "Add64"}:                            struct{}{},
++	{"s390x", "math/bits", "Len"}:                              struct{}{},
++	{"s390x", "math/bits", "Len16"}:                            struct{}{},
++	{"s390x", "math/bits", "Len32"}:                            struct{}{},
++	{"s390x", "math/bits", "Len64"}:                            struct{}{},
++	{"s390x", "math/bits", "Len8"}:                             struct{}{},
++	{"s390x", "math/bits", "Mul"}:                              struct{}{},
++	{"s390x", "math/bits", "Mul64"}:                            struct{}{},
++	{"s390x", "math/bits", "OnesCount"}:                        struct{}{},
++	{"s390x", "math/bits", "OnesCount16"}:                      struct{}{},
++	{"s390x", "math/bits", "OnesCount32"}:                      struct{}{},
++	{"s390x", "math/bits", "OnesCount64"}:                      struct{}{},
++	{"s390x", "math/bits", "OnesCount8"}:                       struct{}{},
++	{"s390x", "math/bits", "ReverseBytes32"}:                   struct{}{},
++	{"s390x", "math/bits", "ReverseBytes64"}:                   struct{}{},
++	{"s390x", "math/bits", "RotateLeft"}:                       struct{}{},
++	{"s390x", "math/bits", "RotateLeft32"}:                     struct{}{},
++	{"s390x", "math/bits", "RotateLeft64"}:                     struct{}{},
++	{"s390x", "math/bits", "Sub"}:                              struct{}{},
++	{"s390x", "math/bits", "Sub64"}:                            struct{}{},
++	{"s390x", "math/bits", "TrailingZeros16"}:                  struct{}{},
++	{"s390x", "math/bits", "TrailingZeros32"}:                  struct{}{},
++	{"s390x", "math/bits", "TrailingZeros64"}:                  struct{}{},
++	{"s390x", "math/bits", "TrailingZeros8"}:                   struct{}{},
++	{"s390x", "runtime", "KeepAlive"}:                          struct{}{},
++	{"s390x", "runtime", "slicebytetostringtmp"}:               struct{}{},
++	{"s390x", "sync/atomic", "AddInt32"}:                       struct{}{},
++	{"s390x", "sync/atomic", "AddInt64"}:                       struct{}{},
++	{"s390x", "sync/atomic", "AddUint32"}:                      struct{}{},
++	{"s390x", "sync/atomic", "AddUint64"}:                      struct{}{},
++	{"s390x", "sync/atomic", "AddUintptr"}:                     struct{}{},
++	{"s390x", "sync/atomic", "CompareAndSwapInt32"}:            struct{}{},
++	{"s390x", "sync/atomic", "CompareAndSwapInt64"}:            struct{}{},
++	{"s390x", "sync/atomic", "CompareAndSwapUint32"}:           struct{}{},
++	{"s390x", "sync/atomic", "CompareAndSwapUint64"}:           struct{}{},
++	{"s390x", "sync/atomic", "CompareAndSwapUintptr"}:          struct{}{},
++	{"s390x", "sync/atomic", "LoadInt32"}:                      struct{}{},
++	{"s390x", "sync/atomic", "LoadInt64"}:                      struct{}{},
++	{"s390x", "sync/atomic", "LoadPointer"}:                    struct{}{},
++	{"s390x", "sync/atomic", "LoadUint32"}:                     struct{}{},
++	{"s390x", "sync/atomic", "LoadUint64"}:                     struct{}{},
++	{"s390x", "sync/atomic", "LoadUintptr"}:                    struct{}{},
++	{"s390x", "sync/atomic", "StoreInt32"}:                     struct{}{},
++	{"s390x", "sync/atomic", "StoreInt64"}:                     struct{}{},
++	{"s390x", "sync/atomic", "StoreUint32"}:                    struct{}{},
++	{"s390x", "sync/atomic", "StoreUint64"}:                    struct{}{},
++	{"s390x", "sync/atomic", "StoreUintptr"}:                   struct{}{},
++	{"s390x", "sync/atomic", "SwapInt32"}:                      struct{}{},
++	{"s390x", "sync/atomic", "SwapInt64"}:                      struct{}{},
++	{"s390x", "sync/atomic", "SwapUint32"}:                     struct{}{},
++	{"s390x", "sync/atomic", "SwapUint64"}:                     struct{}{},
++	{"s390x", "sync/atomic", "SwapUintptr"}:                    struct{}{},
++	{"s390x", "crypto/internal/constanttime", "boolToUint8"}:   struct{}{},
++	{"wasm", "internal/runtime/sys", "GetCallerPC"}:            struct{}{},
++	{"wasm", "internal/runtime/sys", "GetCallerSP"}:            struct{}{},
++	{"wasm", "internal/runtime/sys", "GetClosurePtr"}:          struct{}{},
++	{"wasm", "internal/runtime/sys", "Len64"}:                  struct{}{},
++	{"wasm", "internal/runtime/sys", "Len8"}:                   struct{}{},
++	{"wasm", "internal/runtime/sys", "OnesCount64"}:            struct{}{},
++	{"wasm", "internal/runtime/sys", "TrailingZeros32"}:        struct{}{},
++	{"wasm", "internal/runtime/sys", "TrailingZeros64"}:        struct{}{},
++	{"wasm", "internal/runtime/sys", "TrailingZeros8"}:         struct{}{},
++	{"wasm", "math", "Abs"}:                                    struct{}{},
++	{"wasm", "math", "Ceil"}:                                   struct{}{},
++	{"wasm", "math", "Copysign"}:                               struct{}{},
++	{"wasm", "math", "Floor"}:                                  struct{}{},
++	{"wasm", "math", "RoundToEven"}:                            struct{}{},
++	{"wasm", "math", "Trunc"}:                                  struct{}{},
++	{"wasm", "math", "sqrt"}:                                   struct{}{},
++	{"wasm", "math/big", "mulWW"}:                              struct{}{},
++	{"wasm", "math/bits", "Len"}:                               struct{}{},
++	{"wasm", "math/bits", "Len16"}:                             struct{}{},
++	{"wasm", "math/bits", "Len32"}:                             struct{}{},
++	{"wasm", "math/bits", "Len64"}:                             struct{}{},
++	{"wasm", "math/bits", "Len8"}:                              struct{}{},
++	{"wasm", "math/bits", "Mul"}:                               struct{}{},
++	{"wasm", "math/bits", "Mul64"}:                             struct{}{},
++	{"wasm", "math/bits", "OnesCount"}:                         struct{}{},
++	{"wasm", "math/bits", "OnesCount16"}:                       struct{}{},
++	{"wasm", "math/bits", "OnesCount32"}:                       struct{}{},
++	{"wasm", "math/bits", "OnesCount64"}:                       struct{}{},
++	{"wasm", "math/bits", "OnesCount8"}:                        struct{}{},
++	{"wasm", "math/bits", "RotateLeft"}:                        struct{}{},
++	{"wasm", "math/bits", "RotateLeft32"}:                      struct{}{},
++	{"wasm", "math/bits", "RotateLeft64"}:                      struct{}{},
++	{"wasm", "math/bits", "TrailingZeros16"}:                   struct{}{},
++	{"wasm", "math/bits", "TrailingZeros32"}:                   struct{}{},
++	{"wasm", "math/bits", "TrailingZeros64"}:                   struct{}{},
++	{"wasm", "math/bits", "TrailingZeros8"}:                    struct{}{},
++	{"wasm", "runtime", "KeepAlive"}:                           struct{}{},
++	{"wasm", "runtime", "slicebytetostringtmp"}:                struct{}{},
++	{"wasm", "crypto/internal/constanttime", "Select"}:         struct{}{},
++	{"wasm", "crypto/internal/constanttime", "boolToUint8"}:    struct{}{},
+ }
+ 
+ func TestIntrinsics(t *testing.T) {
+diff --git a/src/cmd/compile/internal/ssagen/ssa.go b/src/cmd/compile/internal/ssagen/ssa.go
+index d5064dedcd..b124dda2f5 100644
+--- a/src/cmd/compile/internal/ssagen/ssa.go
++++ b/src/cmd/compile/internal/ssagen/ssa.go
+@@ -8013,13 +8013,13 @@ func fieldIdx(n *ir.SelectorExpr) int {
+ // ssafn holds frontend information about a function that the backend is processing.
+ // It also exports a bunch of compiler services for the ssa backend.
+ type ssafn struct {
+-	curfn      *ir.Func
++	curfn *ir.Func
+ 	// scratchFpMem is an 8-byte stack slot for int<->float register
+ 	// moves on architectures that must go through memory (32-bit ppc).
+ 	scratchFpMem *ir.Name
+-	strings    map[string]*obj.LSym // map from constant string to data symbols
+-	stksize    int64                // stack size for current frame
+-	stkptrsize int64                // prefix of stack containing pointers
++	strings      map[string]*obj.LSym // map from constant string to data symbols
++	stksize      int64                // stack size for current frame
++	stkptrsize   int64                // prefix of stack containing pointers
+ 
+ 	// alignment for current frame.
+ 	// NOTE: when stkalign > PtrSize, currently this only ensures the offsets of
+diff --git a/src/cmd/internal/disasm/disasm.go b/src/cmd/internal/disasm/disasm.go
+index 3ae8989b38..a453203f33 100644
+--- a/src/cmd/internal/disasm/disasm.go
++++ b/src/cmd/internal/disasm/disasm.go
+@@ -445,6 +445,7 @@ var disasms = map[string]disasmFunc{
+ 	"arm":     disasm_arm,
+ 	"arm64":   disasm_arm64,
+ 	"loong64": disasm_loong64,
++	"ppc":     disasm_ppc64,
+ 	"ppc64":   disasm_ppc64,
+ 	"ppc64le": disasm_ppc64,
+ 	"riscv64": disasm_riscv64,
+@@ -457,6 +458,7 @@ var byteOrders = map[string]binary.ByteOrder{
+ 	"arm":     binary.LittleEndian,
+ 	"arm64":   binary.LittleEndian,
+ 	"loong64": binary.LittleEndian,
++	"ppc":     binary.BigEndian,
+ 	"ppc64":   binary.BigEndian,
+ 	"ppc64le": binary.LittleEndian,
+ 	"riscv64": binary.LittleEndian,
+diff --git a/src/cmd/internal/obj/fips140.go b/src/cmd/internal/obj/fips140.go
+index de7394f8b1..866c8d76a1 100644
+--- a/src/cmd/internal/obj/fips140.go
++++ b/src/cmd/internal/obj/fips140.go
+@@ -135,6 +135,7 @@ see ../../link/internal/ld/fips.go for those details.
+ package obj
+ 
+ import (
++	"cmd/internal/sys"
+ 	"cmd/internal/objabi"
+ 	"fmt"
+ 	"internal/bisect"
+@@ -304,6 +305,12 @@ func (s *LSym) checkFIPSReloc(ctxt *Link, rel Reloc) {
+ 		// calculate the expected hash. Anything goes.
+ 		return
+ 	}
++	if ctxt.Arch.Family == sys.PPC {
++		// 32-bit PowerPC has no position-independent addressing mode;
++		// PIE binaries are externally linked with dynamic text
++		// relocations, so FIPS self-verification cannot be supported.
++		return
++	}
+ 
+ 	// Pseudo-relocations don't show up in code or data and are fine.
+ 	switch rel.Type {
+diff --git a/src/cmd/internal/obj/ppc64/asm9.go b/src/cmd/internal/obj/ppc64/asm9.go
+index 57ec9d9e71..5e14f1741c 100644
+--- a/src/cmd/internal/obj/ppc64/asm9.go
++++ b/src/cmd/internal/obj/ppc64/asm9.go
+@@ -909,7 +909,9 @@ func (c *ctxt9) aclass(a *obj.Addr) int {
+ 				break
+ 			} else if a.Sym.Type == objabi.STLSBSS {
+ 				// For PIC builds, use 12 byte got initial-exec TLS accesses.
+-				if c.ctxt.Flag_shared {
++				// ppc32 PIE binaries are linked externally with text
++				// relocations and keep using local-exec.
++				if c.ctxt.Flag_shared && !c.is32() {
+ 					return C_TLS_IE
+ 				}
+ 				// Otherwise, use 8 byte local-exec TLS accesses.
+@@ -1258,7 +1260,9 @@ func (c *ctxt9) tlsreg() int16 {
+ }
+ 
+ func NeedTOCpointer(ctxt *obj.Link) bool {
+-	return !pfxEnabled && ctxt.Flag_shared
++	// 32-bit PowerPC has no TOC; -shared (PIE) code keeps absolute
++	// addressing and relies on dynamic text relocations.
++	return !pfxEnabled && ctxt.Flag_shared && ctxt.Arch.PtrSize != 4
+ }
+ 
+ // Build the opcode table
+@@ -2441,7 +2445,7 @@ func (c *ctxt9) symbolAccess(s *obj.LSym, d int64, reg int16, op uint32, reuse b
+ 	}
+ 	var base uint32
+ 	form := c.opform(op)
+-	if c.ctxt.Flag_shared {
++	if c.ctxt.Flag_shared && !c.is32() {
+ 		base = REG_R2
+ 	} else {
+ 		base = REG_R0
+@@ -2456,7 +2460,7 @@ func (c *ctxt9) symbolAccess(s *obj.LSym, d int64, reg int16, op uint32, reuse b
+ 		o2 = AOP_IRR(op, uint32(reg), uint32(reg), 0)
+ 	}
+ 	var typ objabi.RelocType
+-	if c.ctxt.Flag_shared {
++	if c.ctxt.Flag_shared && !c.is32() {
+ 		switch form {
+ 		case D_FORM:
+ 			typ = objabi.R_ADDRPOWER_TOCREL
+diff --git a/src/cmd/internal/objfile/elf.go b/src/cmd/internal/objfile/elf.go
+index 6da31906b5..c3974824bd 100644
+--- a/src/cmd/internal/objfile/elf.go
++++ b/src/cmd/internal/objfile/elf.go
+@@ -112,6 +112,8 @@ func (f *elfFile) goarch() string {
+ 		return "arm64"
+ 	case elf.EM_LOONGARCH:
+ 		return "loong64"
++	case elf.EM_PPC:
++		return "ppc"
+ 	case elf.EM_PPC64:
+ 		if f.elf.ByteOrder == binary.LittleEndian {
+ 			return "ppc64le"
+diff --git a/src/internal/platform/supported.go b/src/internal/platform/supported.go
+index fa5ab57911..5107776949 100644
+--- a/src/internal/platform/supported.go
++++ b/src/internal/platform/supported.go
+@@ -180,7 +180,7 @@ func BuildModeSupported(compiler, buildmode, goos, goarch string) bool {
+ 
+ 	case "pie":
+ 		switch platform {
+-		case "linux/386", "linux/amd64", "linux/arm", "linux/arm64", "linux/loong64", "linux/ppc64", "linux/ppc64le", "linux/riscv64", "linux/s390x",
++		case "linux/386", "linux/amd64", "linux/arm", "linux/arm64", "linux/loong64", "linux/ppc", "linux/ppc64", "linux/ppc64le", "linux/riscv64", "linux/s390x",
+ 			"android/amd64", "android/arm", "android/arm64", "android/386",
+ 			"freebsd/amd64",
+ 			"darwin/amd64", "darwin/arm64",
+-- 
+2.55.0
+

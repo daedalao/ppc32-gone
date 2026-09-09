@@ -1,0 +1,180 @@
+From 6e64a0adb07ec43e0bd015f3296d7231e8360060 Mon Sep 17 00:00:00 2001
+From: daedalao <daedalao@hotmail.com>
+Date: Wed, 9 Sep 2026 03:08:20 -0700
+Subject: [PATCH 10/12] cmd/link: trampolines for linux/ppc
+
+Direct branches on 32-bit PowerPC reach +/-32 MB. Large binaries (for
+example charmbracelet/crush, 120 MB) exceeded that and failed with
+"direct call too far", and GNU ld does not insert long-branch stubs for
+ppc32 by default. Port the ppc64 trampoline support: split text into
+sections of at most TrampLimit for external linking, and emit
+lis/addi/mtctr/bctr trampolines with an R_ADDRPOWER pair for calls that
+are out of range (or cross sections when linking externally).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0117Su2urNmg96oYM6vhHi1y
+---
+ src/cmd/link/internal/ld/data.go |   6 +-
+ src/cmd/link/internal/ppc/asm.go | 104 +++++++++++++++++++++++++++++++
+ src/cmd/link/internal/ppc/obj.go |   2 +
+ 3 files changed, 109 insertions(+), 3 deletions(-)
+
+diff --git a/src/cmd/link/internal/ld/data.go b/src/cmd/link/internal/ld/data.go
+index 71ab8490a8..029b84e24a 100644
+--- a/src/cmd/link/internal/ld/data.go
++++ b/src/cmd/link/internal/ld/data.go
+@@ -85,8 +85,8 @@ func maxSizeTrampolines(ctxt *Link, ldr *loader.Loader, s loader.Sym, isTramp bo
+ 		return n * 12 // Trampolines in ARM64 are 3 instructions.
+ 	case ctxt.IsLOONG64():
+ 		return n * 12 // Trampolines in LOONG64 are 3 instructions.
+-	case ctxt.IsPPC64():
+-		return n * 16 // Trampolines in PPC64 are 4 instructions.
++	case ctxt.IsPPC64(), ctxt.IsPPC():
++		return n * 16 // Trampolines in PPC64 and PPC are 4 instructions.
+ 	case ctxt.IsRISCV64():
+ 		return n * 8 // Trampolines in RISCV64 are 2 instructions.
+ 	}
+@@ -2984,7 +2984,7 @@ func resetAddress(ctxt *Link, s loader.Sym) {
+ // machinery in the external linker; see #58425 for more on the
+ // history here.
+ func splitTextSections(ctxt *Link) bool {
+-	return (ctxt.IsARM() || ctxt.IsPPC64() || (ctxt.IsARM64() && ctxt.IsDarwin())) && ctxt.IsExternal()
++	return (ctxt.IsARM() || ctxt.IsPPC() || ctxt.IsPPC64() || (ctxt.IsARM64() && ctxt.IsDarwin())) && ctxt.IsExternal()
+ }
+ 
+ // On Wasm, we reserve 4096 bytes for zero page, then 8192 bytes for wasm_exec.js
+diff --git a/src/cmd/link/internal/ppc/asm.go b/src/cmd/link/internal/ppc/asm.go
+index d0290c3db3..af825900d7 100644
+--- a/src/cmd/link/internal/ppc/asm.go
++++ b/src/cmd/link/internal/ppc/asm.go
+@@ -13,6 +13,8 @@
+ package ppc
+ 
+ import (
++	"fmt"
++
+ 	"cmd/internal/objabi"
+ 	"cmd/internal/sys"
+ 	"cmd/link/internal/ld"
+@@ -205,3 +207,105 @@ func extreloc(target *ld.Target, ldr *loader.Loader, r loader.Reloc, s loader.Sy
+ 	}
+ 	return loader.ExtReloc{}, false
+ }
++
++const (
++	opLisR12     = 0x3d800000 // lis   r12,0   (addis r12,r0,0)
++	opAddiR12R12 = 0x398c0000 // addi  r12,r12,0
++	opMtctrR12   = 0x7d8903a6 // mtctr r12
++	opBctr       = 0x4e800420 // bctr
++)
++
++// trampoline creates a trampoline for the direct call relocation ri of
++// s to rs when the target is out of the 26-bit range of a bl/b
++// instruction. This mirrors the ppc64 implementation without any of the
++// TOC handling: 32-bit PowerPC code uses absolute addresses throughout.
++func trampoline(ctxt *ld.Link, ldr *loader.Loader, ri int, rs, s loader.Sym) {
++	relocs := ldr.Relocs(s)
++	r := relocs.At(ri)
++	var t int64
++	// ldr.SymValue(rs) == 0 indicates a cross-package jump to a function that is not yet
++	// laid out. Conservatively use a trampoline.
++	if ldr.SymValue(rs) != 0 {
++		t = ldr.SymValue(rs) + r.Add() - (ldr.SymValue(s) + int64(r.Off()))
++	}
++	switch r.Type() {
++	case objabi.R_CALLPOWER:
++		// With external linking the text is split into sections of at most
++		// TrampLimit bytes, so calls within a section are always in range
++		// and every cross-section call goes through a trampoline.
++		if (ctxt.IsExternal() && ldr.SymSect(s) != ldr.SymSect(rs)) || (ctxt.IsInternal() && int64(int32(t<<6)>>6) != t) || ldr.SymValue(rs) == 0 || (*ld.FlagDebugTramp > 1 && ldr.SymPkg(s) != ldr.SymPkg(rs)) {
++			var tramp loader.Sym
++			for i := 0; ; i++ {
++				// The addend is part of the name: calls to duff+8 and
++				// duff+256 need distinct trampolines.
++				oName := ldr.SymName(rs)
++				name := oName
++				if r.Add() == 0 {
++					name += fmt.Sprintf("-tramp%d", i)
++				} else {
++					name += fmt.Sprintf("%+x-tramp%d", r.Add(), i)
++				}
++				tramp = ldr.LookupOrCreateSym(name, ldr.SymVersion(rs))
++				if oName == "runtime.deferreturn" {
++					ldr.SetIsDeferReturnTramp(tramp, true)
++				}
++				if ldr.SymValue(tramp) == 0 {
++					break
++				}
++				t = ldr.SymValue(tramp) - (ldr.SymValue(s) + int64(r.Off()))
++				if (ctxt.IsInternal() && int64(int32(t<<6)>>6) == t) || (ctxt.IsExternal() && ldr.SymSect(s) == ldr.SymSect(tramp)) {
++					break
++				}
++			}
++			if ldr.SymType(tramp) == 0 {
++				trampb := ldr.MakeSymbolUpdater(tramp)
++				ctxt.AddTramp(trampb, ldr.SymType(s))
++				gentramp(ctxt, ldr, trampb, rs, r.Add())
++			}
++			sb := ldr.MakeSymbolUpdater(s)
++			relocs := sb.Relocs()
++			r := relocs.At(ri)
++			r.SetSym(tramp)
++			r.SetAdd(0) // folded into the trampoline target address
++		}
++	default:
++		ctxt.Errorf(s, "trampoline called with non-jump reloc: %d (%s)", r.Type(), sym.RelocName(ctxt.Arch, r.Type()))
++	}
++}
++
++// gentramp writes a four-instruction trampoline that jumps to target+offset:
++//
++//	lis   r12, target@ha
++//	addi  r12, r12, target@l
++//	mtctr r12
++//	bctr
++//
++// R12 is a caller-saved scratch register in the Go ppc ABI and is not
++// live across calls, and trampolines are not preemption safe points.
++func gentramp(ctxt *ld.Link, ldr *loader.Loader, tramp *loader.SymbolBuilder, target loader.Sym, offset int64) {
++	tramp.SetSize(16)
++	P := make([]byte, tramp.Size())
++	o1 := uint32(opLisR12)
++	o2 := uint32(opAddiR12R12)
++
++	t := ldr.SymValue(target)
++	if t == 0 || ctxt.IsExternal() {
++		// Target address is unknown, or the external linker will lay
++		// out the sections: generate an ADDR16_HA/ADDR16_LO pair.
++		r, _ := tramp.AddRel(objabi.R_ADDRPOWER)
++		r.SetOff(0)
++		r.SetSiz(8)
++		r.SetSym(target)
++		r.SetAdd(offset)
++	} else {
++		t += offset
++		o1 |= (uint32(t) + 0x8000) >> 16 // HA
++		o2 |= uint32(t) & 0xFFFF         // LO
++	}
++
++	ctxt.Arch.ByteOrder.PutUint32(P, o1)
++	ctxt.Arch.ByteOrder.PutUint32(P[4:], o2)
++	ctxt.Arch.ByteOrder.PutUint32(P[8:], opMtctrR12)
++	ctxt.Arch.ByteOrder.PutUint32(P[12:], opBctr)
++	tramp.SetData(P)
++}
+diff --git a/src/cmd/link/internal/ppc/obj.go b/src/cmd/link/internal/ppc/obj.go
+index 9809c14b41..4a5441ec68 100644
+--- a/src/cmd/link/internal/ppc/obj.go
++++ b/src/cmd/link/internal/ppc/obj.go
+@@ -27,6 +27,8 @@ func Init() (*sys.Arch, ld.Arch) {
+ 		Extreloc:         extreloc,
+ 		Gentext:          gentext,
+ 		Machoreloc1:      machoreloc1,
++		TrampLimit:       0x1c00000,
++		Trampoline:       trampoline,
+ 
+ 		ELF: ld.ELFArch{
+ 			Linuxdynld:     "/lib/ld.so.1",
+-- 
+2.55.0
+

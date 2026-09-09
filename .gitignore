@@ -1,0 +1,5 @@
+go/src/
+go/pkg/
+go/go/
+*.pkg.tar.zst
+*.log

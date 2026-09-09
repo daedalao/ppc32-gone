@@ -1,0 +1,28 @@
+From bd4fdf5c36a20eabd02cda988b9ac16618d76123 Mon Sep 17 00:00:00 2001
+From: daedalao <daedalao@hotmail.com>
+Date: Tue, 8 Sep 2026 21:21:36 -0700
+Subject: [PATCH 07/12] cmd/dist: detect ppc host (uname -m output has a
+ trailing newline)
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0117Su2urNmg96oYM6vhHi1y
+---
+ src/cmd/dist/main.go | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/cmd/dist/main.go b/src/cmd/dist/main.go
+index b5a23b1946..9e98725b24 100644
+--- a/src/cmd/dist/main.go
++++ b/src/cmd/dist/main.go
+@@ -110,7 +110,7 @@ func main() {
+ 			if gohostos == "netbsd" && strings.Contains(run("", CheckExit, "uname", "-p"), "aarch64") {
+ 				gohostarch = "arm64"
+ 			}
+-		case out == "ppc":
++		case strings.TrimSpace(out) == "ppc":
+ 			gohostarch = "ppc"
+ 		case strings.Contains(out, "ppc64le"):
+ 			gohostarch = "ppc64le"
+-- 
+2.55.0
+

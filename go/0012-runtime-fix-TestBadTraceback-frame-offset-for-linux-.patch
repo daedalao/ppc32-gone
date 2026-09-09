@@ -1,0 +1,29 @@
+From 601792d36a3f7bdeceb3be8407683cdeea485525 Mon Sep 17 00:00:00 2001
+From: daedalao <daedalao@hotmail.com>
+Date: Wed, 9 Sep 2026 03:28:25 -0700
+Subject: [PATCH 12/12] runtime: fix TestBadTraceback frame offset for
+ linux/ppc
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0117Su2urNmg96oYM6vhHi1y
+---
+ src/runtime/testdata/testprog/badtraceback.go | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/runtime/testdata/testprog/badtraceback.go b/src/runtime/testdata/testprog/badtraceback.go
+index 455118a543..192a013d2f 100644
+--- a/src/runtime/testdata/testprog/badtraceback.go
++++ b/src/runtime/testdata/testprog/badtraceback.go
+@@ -41,6 +41,9 @@ func badLR2(arg int) {
+ 	if runtime.GOARCH == "ppc64" || runtime.GOARCH == "ppc64le" {
+ 		lrOff = 32 // FIXED_FRAME or sys.MinFrameSize
+ 	}
++	if runtime.GOARCH == "ppc" {
++		lrOff = 8 // FIXED_FRAME or sys.MinFrameSize
++	}
+ 	lrPtr := (*uintptr)(unsafe.Pointer(uintptr(unsafe.Pointer(&arg)) - lrOff))
+ 	*lrPtr = 0xbad
+ 
+-- 
+2.55.0
+

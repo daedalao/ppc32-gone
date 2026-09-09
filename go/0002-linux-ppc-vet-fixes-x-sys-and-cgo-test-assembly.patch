@@ -1,0 +1,201 @@
+From c280e7015641f3a1e9dc7a1d571c57521deeadd4 Mon Sep 17 00:00:00 2001
+From: daedalao <daedalao@hotmail.com>
+Date: Tue, 8 Sep 2026 20:31:30 -0700
+Subject: [PATCH 02/12] linux/ppc: vet fixes, x/sys and cgo test assembly
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0117Su2urNmg96oYM6vhHi1y
+---
+ src/cmd/cgo/internal/test/issue9400/asm_ppc.s | 30 +++++++++++
+ .../golang.org/x/sys/unix/asm_linux_ppc.s     | 54 +++++++++++++++++++
+ .../go/analysis/passes/asmdecl/asmdecl.go     |  2 +
+ src/internal/runtime/atomic/atomic_ppc.s      |  2 +-
+ src/runtime/asm_ppc.s                         |  4 +-
+ src/runtime/sys_linux_ppc.s                   | 12 ++---
+ 6 files changed, 95 insertions(+), 9 deletions(-)
+ create mode 100644 src/cmd/cgo/internal/test/issue9400/asm_ppc.s
+ create mode 100644 src/cmd/vendor/golang.org/x/sys/unix/asm_linux_ppc.s
+
+diff --git a/src/cmd/cgo/internal/test/issue9400/asm_ppc.s b/src/cmd/cgo/internal/test/issue9400/asm_ppc.s
+new file mode 100644
+index 0000000000..31d05f76f9
+--- /dev/null
++++ b/src/cmd/cgo/internal/test/issue9400/asm_ppc.s
+@@ -0,0 +1,30 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build ppc && gc
++
++#include "textflag.h"
++
++TEXT ·RewindAndSetgid(SB),NOSPLIT|NOFRAME,$0-0
++	// Rewind stack pointer so anything that happens on the stack
++	// will clobber the test pattern created by the caller
++	ADD	$(1024*8), R1
++
++	// Ask signaller to setgid
++	MOVW	$1, R3
++	SYNC
++	MOVW	R3, ·Baton(SB)
++	SYNC
++
++	// Wait for setgid completion
++loop:
++	SYNC
++	MOVW	·Baton(SB), R3
++	CMPW	R3, $0
++	BNE	loop
++	SYNC
++
++	// Restore stack
++	ADD	$(-1024*8), R1
++	RET
+diff --git a/src/cmd/vendor/golang.org/x/sys/unix/asm_linux_ppc.s b/src/cmd/vendor/golang.org/x/sys/unix/asm_linux_ppc.s
+new file mode 100644
+index 0000000000..de81368ed7
+--- /dev/null
++++ b/src/cmd/vendor/golang.org/x/sys/unix/asm_linux_ppc.s
+@@ -0,0 +1,54 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build linux && ppc && gc
++
++#include "textflag.h"
++
++//
++// System calls for ppc, Linux
++//
++
++// Just jump to package syscall's implementation for all these functions.
++// The runtime may know about them.
++
++TEXT ·Syscall(SB),NOSPLIT,$0-28
++	JMP	syscall·Syscall(SB)
++
++TEXT ·Syscall6(SB),NOSPLIT,$0-40
++	JMP	syscall·Syscall6(SB)
++
++TEXT ·SyscallNoError(SB),NOSPLIT,$0-24
++	BL	runtime·entersyscall(SB)
++	MOVW	a1+4(FP), R3
++	MOVW	a2+8(FP), R4
++	MOVW	a3+12(FP), R5
++	MOVW	R0, R6
++	MOVW	R0, R7
++	MOVW	R0, R8
++	MOVW	trap+0(FP), R9	// syscall entry
++	SYSCALL	R9
++	MOVW	R3, r1+16(FP)
++	MOVW	R4, r2+20(FP)
++	BL	runtime·exitsyscall(SB)
++	RET
++
++TEXT ·RawSyscall(SB),NOSPLIT,$0-28
++	JMP	syscall·RawSyscall(SB)
++
++TEXT ·RawSyscall6(SB),NOSPLIT,$0-40
++	JMP	syscall·RawSyscall6(SB)
++
++TEXT ·RawSyscallNoError(SB),NOSPLIT,$0-24
++	MOVW	a1+4(FP), R3
++	MOVW	a2+8(FP), R4
++	MOVW	a3+12(FP), R5
++	MOVW	R0, R6
++	MOVW	R0, R7
++	MOVW	R0, R8
++	MOVW	trap+0(FP), R9	// syscall entry
++	SYSCALL	R9
++	MOVW	R3, r1+16(FP)
++	MOVW	R4, r2+20(FP)
++	RET
+diff --git a/src/cmd/vendor/golang.org/x/tools/go/analysis/passes/asmdecl/asmdecl.go b/src/cmd/vendor/golang.org/x/tools/go/analysis/passes/asmdecl/asmdecl.go
+index ba9ca38a81..2eea344b1d 100644
+--- a/src/cmd/vendor/golang.org/x/tools/go/analysis/passes/asmdecl/asmdecl.go
++++ b/src/cmd/vendor/golang.org/x/tools/go/analysis/passes/asmdecl/asmdecl.go
+@@ -93,6 +93,7 @@ var (
+ 	asmArchMipsLE   = asmArch{name: "mipsle", bigEndian: false, stack: "R29", lr: true}
+ 	asmArchMips64   = asmArch{name: "mips64", bigEndian: true, stack: "R29", lr: true}
+ 	asmArchMips64LE = asmArch{name: "mips64le", bigEndian: false, stack: "R29", lr: true}
++	asmArchPpc      = asmArch{name: "ppc", bigEndian: true, stack: "R1", lr: true, writeResult: []string{"SYSCALL"}}
+ 	asmArchPpc64    = asmArch{name: "ppc64", bigEndian: true, stack: "R1", lr: true, retRegs: []string{"R3", "F1"}, writeResult: []string{"SYSCALL"}}
+ 	asmArchPpc64LE  = asmArch{name: "ppc64le", bigEndian: false, stack: "R1", lr: true, retRegs: []string{"R3", "F1"}, writeResult: []string{"SYSCALL"}}
+ 	asmArchRISCV64  = asmArch{name: "riscv64", bigEndian: false, stack: "SP", lr: true, retRegs: []string{"X10", "F10"}, writeResult: []string{"ECALL"}}
+@@ -109,6 +110,7 @@ var (
+ 		&asmArchMipsLE,
+ 		&asmArchMips64,
+ 		&asmArchMips64LE,
++		&asmArchPpc,
+ 		&asmArchPpc64,
+ 		&asmArchPpc64LE,
+ 		&asmArchRISCV64,
+diff --git a/src/internal/runtime/atomic/atomic_ppc.s b/src/internal/runtime/atomic/atomic_ppc.s
+index 885b797416..dd83bb1d9f 100644
+--- a/src/internal/runtime/atomic/atomic_ppc.s
++++ b/src/internal/runtime/atomic/atomic_ppc.s
+@@ -37,7 +37,7 @@ cas_fail:
+ 	RET
+ 
+ TEXT ·CasRel(SB), NOSPLIT, $0-13
+-	MOVW	ptr+0(FP), R3
++	MOVW	addr+0(FP), R3
+ 	MOVW	old+4(FP), R4
+ 	MOVW	new+8(FP), R5
+ 	SYNC
+diff --git a/src/runtime/asm_ppc.s b/src/runtime/asm_ppc.s
+index a74d2b605f..9a7bbdbb26 100644
+--- a/src/runtime/asm_ppc.s
++++ b/src/runtime/asm_ppc.s
+@@ -731,8 +731,8 @@ retry:
+ 	MOVW	SPR(TBU), R6
+ 	CMPW	R4, R6
+ 	BNE	retry
+-	MOVW	R4, ret+0(FP)	// high word first (big endian)
+-	MOVW	R5, ret+4(FP)
++	MOVW	R4, ret_hi+0(FP)	// high word first (big endian)
++	MOVW	R5, ret_lo+4(FP)
+ 	RET
+ 
+ // Called from cgo wrappers, this function returns g->m->curg.stack.hi.
+diff --git a/src/runtime/sys_linux_ppc.s b/src/runtime/sys_linux_ppc.s
+index 2a6b325779..9a83f2c402 100644
+--- a/src/runtime/sys_linux_ppc.s
++++ b/src/runtime/sys_linux_ppc.s
+@@ -234,16 +234,16 @@ TEXT runtime·walltime(SB),NOSPLIT,$16-12
+ 	MOVW	FIXED_FRAME+0(R1), R5	// sec (int32)
+ 	MOVW	FIXED_FRAME+4(R1), R6	// nsec
+ 	SRAW	$31, R5, R7		// sign extend sec to int64
+-	MOVW	R7, sec+0(FP)
+-	MOVW	R5, sec+4(FP)
++	MOVW	R7, sec_hi+0(FP)
++	MOVW	R5, sec_lo+4(FP)
+ 	MOVW	R6, nsec+8(FP)
+ 	RET
+ ok64:
+ 	MOVW	FIXED_FRAME+0(R1), R5	// sec hi
+ 	MOVW	FIXED_FRAME+4(R1), R6	// sec lo
+ 	MOVW	FIXED_FRAME+12(R1), R7	// nsec (low word of the 64-bit field)
+-	MOVW	R5, sec+0(FP)
+-	MOVW	R6, sec+4(FP)
++	MOVW	R5, sec_hi+0(FP)
++	MOVW	R6, sec_lo+4(FP)
+ 	MOVW	R7, nsec+8(FP)
+ 	RET
+ 
+@@ -273,8 +273,8 @@ compute:
+ 	ADD	R11, R9
+ 	ADDC	R7, R10		// lo += nsec
+ 	ADDZE	R9, R9		// hi += carry
+-	MOVW	R9, ret+0(FP)
+-	MOVW	R10, ret+4(FP)
++	MOVW	R9, ret_hi+0(FP)
++	MOVW	R10, ret_lo+4(FP)
+ 	RET
+ 
+ TEXT runtime·rtsigprocmask(SB),NOSPLIT|NOFRAME,$0-16
+-- 
+2.55.0
+

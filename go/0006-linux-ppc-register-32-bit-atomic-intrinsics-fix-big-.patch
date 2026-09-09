@@ -1,0 +1,177 @@
+From a5b33410f98454469c66c3fdc83413409328698f Mon Sep 17 00:00:00 2001
+From: daedalao <daedalao@hotmail.com>
+Date: Tue, 8 Sep 2026 21:19:14 -0700
+Subject: [PATCH 06/12] linux/ppc: register 32-bit atomic intrinsics; fix
+ big-endian memHash64
+
+internal/runtime/maps: on big-endian 32-bit targets memHash64Fallback
+mixed the halves of the key in the opposite order from memHashFallback,
+so the two hash paths disagreed (TestMemHash64Equality). Also add ppc to
+the gcinfo test table and the asmdecl vet arch list.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0117Su2urNmg96oYM6vhHi1y
+---
+ src/cmd/compile/internal/ssagen/intrinsics.go | 24 +++++++++----------
+ src/internal/runtime/maps/runtime_hash32.go   | 16 ++++++++++---
+ src/runtime/gcinfo_test.go                    |  2 +-
+ 3 files changed, 26 insertions(+), 16 deletions(-)
+
+diff --git a/src/cmd/compile/internal/ssagen/intrinsics.go b/src/cmd/compile/internal/ssagen/intrinsics.go
+index 6a0c4e41a3..5694be3614 100644
+--- a/src/cmd/compile/internal/ssagen/intrinsics.go
++++ b/src/cmd/compile/internal/ssagen/intrinsics.go
+@@ -167,7 +167,7 @@ func initIntrinsics(cfg *intrinsicBuildConfig) {
+ 			s.vars[memVar] = s.newValue1(ssaop.OpPubBarrier, types.TypeMem, s.mem())
+ 			return nil
+ 		},
+-		sys.ARM64, sys.Loong64, sys.MIPS, sys.MIPS64, sys.PPC64, sys.RISCV64)
++		sys.ARM64, sys.Loong64, sys.MIPS, sys.MIPS64, sys.PPC, sys.PPC64, sys.RISCV64)
+ 
+ 	/******** internal/runtime/sys ********/
+ 	add("internal/runtime/sys", "GetCallerPC",
+@@ -257,14 +257,14 @@ func initIntrinsics(cfg *intrinsicBuildConfig) {
+ 			s.vars[memVar] = s.newValue1(ssaop.OpSelect1, types.TypeMem, v)
+ 			return s.newValue1(ssaop.OpSelect0, types.Types[types.TUINT32], v)
+ 		},
+-		sys.AMD64, sys.ARM64, sys.Loong64, sys.MIPS, sys.MIPS64, sys.PPC64, sys.RISCV64, sys.S390X)
++		sys.AMD64, sys.ARM64, sys.Loong64, sys.MIPS, sys.MIPS64, sys.PPC, sys.PPC64, sys.RISCV64, sys.S390X)
+ 	addF("internal/runtime/atomic", "Load8",
+ 		func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
+ 			v := s.newValue2(ssaop.OpAtomicLoad8, types.NewTuple(types.Types[types.TUINT8], types.TypeMem), args[0], s.mem())
+ 			s.vars[memVar] = s.newValue1(ssaop.OpSelect1, types.TypeMem, v)
+ 			return s.newValue1(ssaop.OpSelect0, types.Types[types.TUINT8], v)
+ 		},
+-		sys.AMD64, sys.ARM64, sys.Loong64, sys.MIPS, sys.MIPS64, sys.PPC64, sys.RISCV64, sys.S390X)
++		sys.AMD64, sys.ARM64, sys.Loong64, sys.MIPS, sys.MIPS64, sys.PPC, sys.PPC64, sys.RISCV64, sys.S390X)
+ 	addF("internal/runtime/atomic", "Load64",
+ 		func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
+ 			v := s.newValue2(ssaop.OpAtomicLoad64, types.NewTuple(types.Types[types.TUINT64], types.TypeMem), args[0], s.mem())
+@@ -292,20 +292,20 @@ func initIntrinsics(cfg *intrinsicBuildConfig) {
+ 			s.vars[memVar] = s.newValue1(ssaop.OpSelect1, types.TypeMem, v)
+ 			return s.newValue1(ssaop.OpSelect0, s.f.Config.Types.BytePtr, v)
+ 		},
+-		sys.AMD64, sys.ARM64, sys.Loong64, sys.MIPS, sys.MIPS64, sys.PPC64, sys.RISCV64, sys.S390X)
++		sys.AMD64, sys.ARM64, sys.Loong64, sys.MIPS, sys.MIPS64, sys.PPC, sys.PPC64, sys.RISCV64, sys.S390X)
+ 
+ 	addF("internal/runtime/atomic", "Store",
+ 		func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
+ 			s.vars[memVar] = s.newValue3(ssaop.OpAtomicStore32, types.TypeMem, args[0], args[1], s.mem())
+ 			return nil
+ 		},
+-		sys.AMD64, sys.ARM64, sys.MIPS, sys.MIPS64, sys.PPC64, sys.RISCV64, sys.S390X)
++		sys.AMD64, sys.ARM64, sys.MIPS, sys.MIPS64, sys.PPC, sys.PPC64, sys.RISCV64, sys.S390X)
+ 	addF("internal/runtime/atomic", "Store8",
+ 		func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
+ 			s.vars[memVar] = s.newValue3(ssaop.OpAtomicStore8, types.TypeMem, args[0], args[1], s.mem())
+ 			return nil
+ 		},
+-		sys.AMD64, sys.ARM64, sys.Loong64, sys.MIPS, sys.MIPS64, sys.PPC64, sys.RISCV64, sys.S390X)
++		sys.AMD64, sys.ARM64, sys.Loong64, sys.MIPS, sys.MIPS64, sys.PPC, sys.PPC64, sys.RISCV64, sys.S390X)
+ 	addF("internal/runtime/atomic", "Store64",
+ 		func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
+ 			s.vars[memVar] = s.newValue3(ssaop.OpAtomicStore64, types.TypeMem, args[0], args[1], s.mem())
+@@ -317,7 +317,7 @@ func initIntrinsics(cfg *intrinsicBuildConfig) {
+ 			s.vars[memVar] = s.newValue3(ssaop.OpAtomicStorePtrNoWB, types.TypeMem, args[0], args[1], s.mem())
+ 			return nil
+ 		},
+-		sys.AMD64, sys.ARM64, sys.Loong64, sys.MIPS, sys.MIPS64, sys.RISCV64, sys.S390X)
++		sys.AMD64, sys.ARM64, sys.Loong64, sys.MIPS, sys.MIPS64, sys.PPC, sys.RISCV64, sys.S390X)
+ 	addF("internal/runtime/atomic", "StoreRel",
+ 		func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
+ 			s.vars[memVar] = s.newValue3(ssaop.OpAtomicStoreRel32, types.TypeMem, args[0], args[1], s.mem())
+@@ -391,7 +391,7 @@ func initIntrinsics(cfg *intrinsicBuildConfig) {
+ 			s.vars[memVar] = s.newValue1(ssaop.OpSelect1, types.TypeMem, v)
+ 			return s.newValue1(ssaop.OpSelect0, types.Types[types.TUINT32], v)
+ 		},
+-		sys.AMD64, sys.Loong64, sys.MIPS, sys.MIPS64, sys.PPC64, sys.RISCV64, sys.S390X)
++		sys.AMD64, sys.Loong64, sys.MIPS, sys.MIPS64, sys.PPC, sys.PPC64, sys.RISCV64, sys.S390X)
+ 	addF("internal/runtime/atomic", "Xchg64",
+ 		func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
+ 			v := s.newValue3(ssaop.OpAtomicExchange64, types.NewTuple(types.Types[types.TUINT64], types.TypeMem), args[0], args[1], s.mem())
+@@ -504,7 +504,7 @@ func initIntrinsics(cfg *intrinsicBuildConfig) {
+ 			s.vars[memVar] = s.newValue1(ssaop.OpSelect1, types.TypeMem, v)
+ 			return s.newValue1(ssaop.OpSelect0, types.Types[types.TUINT32], v)
+ 		},
+-		sys.AMD64, sys.Loong64, sys.MIPS, sys.MIPS64, sys.PPC64, sys.RISCV64, sys.S390X)
++		sys.AMD64, sys.Loong64, sys.MIPS, sys.MIPS64, sys.PPC, sys.PPC64, sys.RISCV64, sys.S390X)
+ 	addF("internal/runtime/atomic", "Xadd64",
+ 		func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
+ 			v := s.newValue3(ssaop.OpAtomicAdd64, types.NewTuple(types.Types[types.TUINT64], types.TypeMem), args[0], args[1], s.mem())
+@@ -526,7 +526,7 @@ func initIntrinsics(cfg *intrinsicBuildConfig) {
+ 			s.vars[memVar] = s.newValue1(ssaop.OpSelect1, types.TypeMem, v)
+ 			return s.newValue1(ssaop.OpSelect0, types.Types[types.TBOOL], v)
+ 		},
+-		sys.AMD64, sys.MIPS, sys.MIPS64, sys.PPC64, sys.RISCV64, sys.S390X)
++		sys.AMD64, sys.MIPS, sys.MIPS64, sys.PPC, sys.PPC64, sys.RISCV64, sys.S390X)
+ 	addF("internal/runtime/atomic", "Cas64",
+ 		func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
+ 			v := s.newValue4(ssaop.OpAtomicCompareAndSwap64, types.NewTuple(types.Types[types.TBOOL], types.TypeMem), args[0], args[1], args[2], s.mem())
+@@ -616,7 +616,7 @@ func initIntrinsics(cfg *intrinsicBuildConfig) {
+ 			s.vars[memVar] = s.newValue3(ssaop.OpAtomicAnd32, types.TypeMem, args[0], args[1], s.mem())
+ 			return nil
+ 		},
+-		sys.AMD64, sys.Loong64, sys.MIPS, sys.MIPS64, sys.PPC64, sys.RISCV64, sys.S390X)
++		sys.AMD64, sys.Loong64, sys.MIPS, sys.MIPS64, sys.PPC, sys.PPC64, sys.RISCV64, sys.S390X)
+ 	addF("internal/runtime/atomic", "Or8",
+ 		func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
+ 			s.vars[memVar] = s.newValue3(ssaop.OpAtomicOr8, types.TypeMem, args[0], args[1], s.mem())
+@@ -628,7 +628,7 @@ func initIntrinsics(cfg *intrinsicBuildConfig) {
+ 			s.vars[memVar] = s.newValue3(ssaop.OpAtomicOr32, types.TypeMem, args[0], args[1], s.mem())
+ 			return nil
+ 		},
+-		sys.AMD64, sys.Loong64, sys.MIPS, sys.MIPS64, sys.PPC64, sys.RISCV64, sys.S390X)
++		sys.AMD64, sys.Loong64, sys.MIPS, sys.MIPS64, sys.PPC, sys.PPC64, sys.RISCV64, sys.S390X)
+ 
+ 	// arm64 always uses the new-style atomic logical operations, for both the
+ 	// old and new style API.
+diff --git a/src/internal/runtime/maps/runtime_hash32.go b/src/internal/runtime/maps/runtime_hash32.go
+index caac448b35..40320ef9c3 100644
+--- a/src/internal/runtime/maps/runtime_hash32.go
++++ b/src/internal/runtime/maps/runtime_hash32.go
+@@ -9,7 +9,10 @@
+ 
+ package maps
+ 
+-import "unsafe"
++import (
++	"internal/goarch"
++	"unsafe"
++)
+ 
+ func memHash32Fallback(k uint32, seed uintptr) uintptr {
+ 	a, b := mix32(uint32(seed), uint32(4^hashkey[0]))
+@@ -22,8 +25,15 @@ func memHash32Fallback(k uint32, seed uintptr) uintptr {
+ 
+ func memHash64Fallback(k uint64, seed uintptr) uintptr {
+ 	a, b := mix32(uint32(seed), uint32(8^hashkey[0]))
+-	a ^= uint32(k)
+-	b ^= uint32(k >> 32)
++	// Mix the two halves in memory order so that the result matches
++	// memHashFallback on the same 8 bytes, on both endiannesses.
++	if goarch.BigEndian {
++		a ^= uint32(k >> 32)
++		b ^= uint32(k)
++	} else {
++		a ^= uint32(k)
++		b ^= uint32(k >> 32)
++	}
+ 	a, b = mix32(a, b)
+ 	a, b = mix32(a, b)
+ 	return uintptr(a ^ b)
+diff --git a/src/runtime/gcinfo_test.go b/src/runtime/gcinfo_test.go
+index 02457f682e..5510a5432d 100644
+--- a/src/runtime/gcinfo_test.go
++++ b/src/runtime/gcinfo_test.go
+@@ -156,7 +156,7 @@ type BigStruct struct {
+ 
+ func infoBigStruct() []byte {
+ 	switch runtime.GOARCH {
+-	case "386", "arm", "mips", "mipsle":
++	case "386", "arm", "mips", "mipsle", "ppc":
+ 		return []byte{
+ 			typePointer,                                                // q *int
+ 			typeScalar, typeScalar, typeScalar, typeScalar, typeScalar, // w byte; e [17]byte
+-- 
+2.55.0
+

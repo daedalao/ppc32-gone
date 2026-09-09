@@ -1,0 +1,117 @@
+From 043111a8a50d6218f5bd2a024c2bd1b4fb925859 Mon Sep 17 00:00:00 2001
+From: daedalao <daedalao@hotmail.com>
+Date: Tue, 8 Sep 2026 21:03:12 -0700
+Subject: [PATCH 04/12] cmd/compile: linux/ppc indirect calls must go through
+ LR, not CTR
+
+runtime.asyncPreempt resumes via CTR, so a goroutine preempted between
+mtctr and bctrl would resume into the bctrl with CTR pointing at itself
+and spin forever. Also zero the unused second syscall result and enable
+32-bit rotates.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0117Su2urNmg96oYM6vhHi1y
+---
+ src/cmd/compile/internal/ppc/ssa.go           | 20 ++++++++++++++-----
+ .../ssa/rewrite/generic/generic_helpers.go    |  2 +-
+ .../golang.org/x/sys/unix/asm_linux_ppc.s     |  4 ++--
+ .../runtime/syscall/linux/asm_linux_ppc.s     |  2 +-
+ src/syscall/asm_linux_ppc.s                   |  2 +-
+ 5 files changed, 20 insertions(+), 10 deletions(-)
+
+diff --git a/src/cmd/compile/internal/ppc/ssa.go b/src/cmd/compile/internal/ppc/ssa.go
+index afa9f9dac8..d609976a06 100644
+--- a/src/cmd/compile/internal/ppc/ssa.go
++++ b/src/cmd/compile/internal/ppc/ssa.go
+@@ -991,17 +991,27 @@ func ssaGenValue(s *ssagen.State, v *ssa.Value) {
+ 		s.TailCall(v)
+ 
+ 	case ssaop.OpPPCCALLclosure, ssaop.OpPPCCALLinter:
+-		// MOVW Rfn, CTR
+-		// BL   (CTR)
++		// MOVW Rfn, LR
++		// BCL  (LR)
++		// The call must go through LR, not CTR: runtime.asyncPreempt
++		// resumes by branching through CTR, so a goroutine preempted
++		// between "mtctr" and "bctrl" would spin on the bctrl forever.
+ 		p := s.Prog(ppc64.AMOVW)
+ 		p.From.Type = obj.TYPE_REG
+ 		p.From.Reg = v.Args[0].Reg()
+ 		p.To.Type = obj.TYPE_REG
+-		p.To.Reg = ppc64.REG_CTR
++		p.To.Reg = ppc64.REG_LR
+ 
+ 		pp := s.Call(v)
+-		pp.To.Type = obj.TYPE_REG
+-		pp.To.Reg = ppc64.REG_CTR
++
++		// Convert the call into a blrl with hint this is not a subroutine return.
++		// The full bclrl opcode must be specified when passing a hint.
++		pp.As = ppc64.ABCL
++		pp.From.Type = obj.TYPE_CONST
++		pp.From.Offset = ppc64.BO_ALWAYS
++		pp.Reg = ppc64.REG_CR0LT // The preferred value if BI is ignored.
++		pp.To.Reg = ppc64.REG_LR
++		pp.AddRestSourceConst(1)
+ 
+ 	case ssaop.OpPPCLoweredWB:
+ 		p := s.Prog(obj.ACALL)
+diff --git a/src/cmd/compile/internal/ssa/rewrite/generic/generic_helpers.go b/src/cmd/compile/internal/ssa/rewrite/generic/generic_helpers.go
+index 72132ec678..37d671d7b7 100644
+--- a/src/cmd/compile/internal/ssa/rewrite/generic/generic_helpers.go
++++ b/src/cmd/compile/internal/ssa/rewrite/generic/generic_helpers.go
+@@ -85,7 +85,7 @@ func canRotate(c *ssa.Config, bits int64) bool {
+ 	switch c.Arch {
+ 	case "386", "amd64", "arm64", "loong64", "riscv64":
+ 		return true
+-	case "arm", "s390x", "ppc64", "ppc64le", "wasm":
++	case "arm", "s390x", "ppc", "ppc64", "ppc64le", "wasm":
+ 		return bits >= 32
+ 	default:
+ 		return false
+diff --git a/src/cmd/vendor/golang.org/x/sys/unix/asm_linux_ppc.s b/src/cmd/vendor/golang.org/x/sys/unix/asm_linux_ppc.s
+index de81368ed7..a5c0371bda 100644
+--- a/src/cmd/vendor/golang.org/x/sys/unix/asm_linux_ppc.s
++++ b/src/cmd/vendor/golang.org/x/sys/unix/asm_linux_ppc.s
+@@ -30,7 +30,7 @@ TEXT ·SyscallNoError(SB),NOSPLIT,$0-24
+ 	MOVW	trap+0(FP), R9	// syscall entry
+ 	SYSCALL	R9
+ 	MOVW	R3, r1+16(FP)
+-	MOVW	R4, r2+20(FP)
++	MOVW	R0, r2+20(FP)	// r2 is not used on linux/ppc
+ 	BL	runtime·exitsyscall(SB)
+ 	RET
+ 
+@@ -50,5 +50,5 @@ TEXT ·RawSyscallNoError(SB),NOSPLIT,$0-24
+ 	MOVW	trap+0(FP), R9	// syscall entry
+ 	SYSCALL	R9
+ 	MOVW	R3, r1+16(FP)
+-	MOVW	R4, r2+20(FP)
++	MOVW	R0, r2+20(FP)	// r2 is not used on linux/ppc
+ 	RET
+diff --git a/src/internal/runtime/syscall/linux/asm_linux_ppc.s b/src/internal/runtime/syscall/linux/asm_linux_ppc.s
+index 40588d3829..5fad1428be 100644
+--- a/src/internal/runtime/syscall/linux/asm_linux_ppc.s
++++ b/src/internal/runtime/syscall/linux/asm_linux_ppc.s
+@@ -24,6 +24,6 @@ TEXT ·Syscall6(SB),NOSPLIT|NOFRAME,$0-40
+ 	RET
+ ok:
+ 	MOVW	R3, r1+28(FP)
+-	MOVW	R4, r2+32(FP)
++	MOVW	R0, r2+32(FP)	// r2 is not used on linux/ppc
+ 	MOVW	R0, errno+36(FP)
+ 	RET
+diff --git a/src/syscall/asm_linux_ppc.s b/src/syscall/asm_linux_ppc.s
+index 412124949c..cc400b37f6 100644
+--- a/src/syscall/asm_linux_ppc.s
++++ b/src/syscall/asm_linux_ppc.s
+@@ -41,5 +41,5 @@ TEXT ·rawSyscallNoError(SB),NOSPLIT|NOFRAME,$0-24
+ 	MOVW	trap+0(FP), R9	// syscall entry
+ 	SYSCALL	R9
+ 	MOVW	R3, r1+16(FP)
+-	MOVW	R4, r2+20(FP)
++	MOVW	R0, r2+20(FP)	// r2 is not used on linux/ppc
+ 	RET
+-- 
+2.55.0
+

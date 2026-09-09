@@ -1,0 +1,136 @@
+# Maintainer: daedalao <daedalao@hotmail.com>
+# Based on the Arch Linux go PKGBUILD by Morten Linderud <foxboron@archlinux.org>
+#
+# Go for Arch POWER 32-bit (linux/ppc). Upstream Go has no 32-bit PowerPC
+# target, so this builds upstream master at the commit the port was written
+# against plus the port itself as a patch series (see README.md).
+#
+# It can be built two ways:
+#   * cross, on any Arch machine with a working go (ppc64le, x86_64, ...):
+#       CARCH=powerpc makepkg
+#     make.bash builds the ppc32 toolchain with the host go and the tree is
+#     laid out like bootstrap.bash does. No ppc bootstrap toolchain needed.
+#   * natively on a powerpc machine that already has this package installed
+#     (GOROOT_BOOTSTRAP=/usr/lib/go, ~70 minutes on a 1.67 GHz G4).
+
+pkgname=go
+epoch=2
+pkgver=1.28.ppc32
+pkgrel=1
+_commit=a14b5433261d7ed98b716b0c71e36a46b7148ef2 # go master, 2026-09-08
+pkgdesc='Core compiler tools for the Go programming language (linux/ppc port)'
+arch=(powerpc)
+url='https://go.dev/'
+license=(BSD-3-Clause)
+makedepends=(git go)
+replaces=(go-pie)
+provides=(go-pie)
+options=(!strip staticlibs)
+source=("git+https://go.googlesource.com/go#commit=$_commit"
+        "0001-all-add-linux-ppc-32-bit-big-endian-PowerPC-port.patch"
+        "0002-linux-ppc-vet-fixes-x-sys-and-cgo-test-assembly.patch"
+        "0003-syscall-linux-ppc-64-bit-args-need-aligned-register-.patch"
+        "0004-cmd-compile-linux-ppc-indirect-calls-must-go-through.patch"
+        "0005-linux-ppc-enable-cgo-external-linking.patch"
+        "0006-linux-ppc-register-32-bit-atomic-intrinsics-fix-big-.patch"
+        "0007-cmd-dist-detect-ppc-host-uname-m-output-has-a-traili.patch"
+        "0008-linux-ppc-PIE-via-external-linking-math-bits-intrins.patch"
+        "0009-cmd-go-implicit-overlay-supplying-golang.org-x-sys-f.patch"
+        "0010-cmd-link-trampolines-for-linux-ppc.patch"
+        "0011-linux-ppc-R12-is-clobbered-by-linker-trampolines.patch"
+        "0012-runtime-fix-TestBadTraceback-frame-offset-for-linux-.patch")
+sha256sums=('SKIP'
+            'f4e8a17ef763103c22aae67a4112de68823c08affea2e91f035f230880e2ed43'
+            'de94a24a4106237e2d28b215c5465f32cfc7718cb3307bfa1b883df5b607944e'
+            '375269a696529029bdb76732ebfe740b48ba165e611109bc9035283eb344e9ab'
+            '90a08b6b48de7c1bac5d0303b84719882ea81e03cf70b83b9c8f234486f8cae5'
+            '95f8a876b8a1dbeaa4d4d121a0d3a5447bb489282caacc8f4b62312e7a0e934e'
+            'c1d28f01ae689206020ecb1ad4797961ab57f5e4f43c109553841606a329b223'
+            '2bef0c066ec3ef8e45e90e2330b5eab134fbde26fecda3e73879cd3c5210265f'
+            'f5326aab1c56040260ec5120a3141cb19295559b5377867ab0c42af8b7fb8af9'
+            'fbcca65227b27fed0a7f89e4b8ad1de6c34aac7d4c8a0b5060b64ec26aaafaa5'
+            'a0adececc7bfce5f6e02492b86d367e07264125fa4ae4054ddc6fd27409f57fb'
+            '729200ae1fc56ec75db3cac01040b8042e34c20ffbef2bfa257573684d18c4f5'
+            'a7501b0aacf0e6bd9ca2e8e92c7008de4e069a305eaaf197f7438377c8e41c60')
+
+prepare() {
+  cd go
+  local p
+  for p in "$srcdir"/*.patch; do
+    msg2 "Applying $(basename "$p")"
+    git apply "$p"
+  done
+  # cmd/dist derives the version from git; the port's commits make that
+  # "go1.28-devel_...". Give the package a stable version string instead.
+  printf 'go%s\ntime %s\n' "$pkgver" "$(date -u -d @${SOURCE_DATE_EPOCH:-$(date +%s)} +%Y-%m-%dT%H:%M:%SZ)" > VERSION
+}
+
+build() {
+  export GOROOT_FINAL=/usr/lib/go
+  # Disable dwarf5 until debugedit catches up (as in the Arch PKGBUILD).
+  export GOEXPERIMENT=nodwarf5
+  # Build scratch can exceed a small tmpfs /tmp (the G4 has 1 GB).
+  export GOTMPDIR="$srcdir/tmp"; mkdir -p "$GOTMPDIR"
+  unset GOROOT GOFLAGS
+
+  cd go/src
+  if [[ "$(go env GOHOSTARCH)" == ppc ]]; then
+    # Native build with the installed go.
+    export GOROOT_BOOTSTRAP=/usr/lib/go
+    ./make.bash -v
+  else
+    # Cross build: host go compiles the ppc toolchain and standard library.
+    export GOROOT_BOOTSTRAP="$(go env GOROOT)"
+    export GOOS=linux GOARCH=ppc
+    # Do not set CGO_ENABLED: cmd/dist bakes an explicit value into the
+    # toolchain as its permanent default. Left unset, the cross build skips
+    # runtime/cgo and the installed go decides at run time (cgo works on
+    # the target when a C compiler is present).
+    unset CGO_ENABLED
+    # cmd/dist likewise bakes the C compiler name in as the toolchain's
+    # default CC. Record the target's compiler, not the host's; this is
+    # also the name of the native gcc on an Arch POWER 32-bit system.
+    export CC_FOR_TARGET="${CC_FOR_TARGET:-powerpc-unknown-linux-gnu-gcc}"
+    ./make.bash -v --no-banner
+    local hostos hostarch
+    hostos="$(../bin/go env GOHOSTOS)"
+    hostarch="$(../bin/go env GOHOSTARCH)"
+    cd ..
+    # Same layout as bootstrap.bash: keep only the ppc tools and packages.
+    rm -f bin/go_linux_ppc_exec
+    mv bin/linux_ppc/* bin/
+    rmdir bin/linux_ppc
+    rm -rf "pkg/${hostos}_${hostarch}" "pkg/tool/${hostos}_${hostarch}"
+  fi
+}
+
+package() {
+  cd go
+
+  install -d "$pkgdir/usr/bin" "$pkgdir/usr/lib/go" "$pkgdir/usr/share/doc/go"
+
+  cp -a bin pkg src lib misc api test "$pkgdir/usr/lib/go"
+  # Strip only the packaged binaries; stripping testdata breaks the tests.
+  # Use the cross strip when building on another architecture.
+  local strip=strip
+  [[ "$(uname -m)" != ppc ]] && command -v powerpc-unknown-linux-gnu-strip >/dev/null && strip=powerpc-unknown-linux-gnu-strip
+  $strip $STRIP_BINARIES "$pkgdir/usr/lib/go"{/bin/*,/pkg/tool/*/*}
+
+  cp -r doc/* "$pkgdir/usr/share/doc/go"
+
+  ln -sf /usr/lib/go/bin/go "$pkgdir/usr/bin/go"
+  ln -sf /usr/lib/go/bin/gofmt "$pkgdir/usr/bin/gofmt"
+  ln -sf /usr/share/doc/go "$pkgdir/usr/lib/go/doc"
+
+  install -Dm644 VERSION "$pkgdir/usr/lib/go/VERSION"
+
+  rm -rf "$pkgdir/usr/lib/go/pkg/bootstrap"
+  rm -rf "$pkgdir"/usr/lib/go/pkg/obj/go-build
+
+  # https://github.com/golang/go/issues/57179
+  install -Dm644 go.env "$pkgdir/usr/lib/go/go.env"
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
+
+# vim: ts=2 sw=2 et

@@ -1,0 +1,383 @@
+From 649cd7206b8683384307462808e4ee4f11e0d2cf Mon Sep 17 00:00:00 2001
+From: daedalao <daedalao@hotmail.com>
+Date: Wed, 9 Sep 2026 03:01:11 -0700
+Subject: [PATCH 09/12] cmd/go: implicit overlay supplying golang.org/x/sys
+ files for linux/ppc
+
+Upstream golang.org/x/sys ships no gc assembly for linux/ppc and no cpu
+package support for ppc, so every module importing x/sys/unix or
+x/sys/cpu fails to build for GOARCH=ppc. Until that lands upstream,
+cmd/go adds an implicit overlay (fsys.Implicit) that supplies
+misc/ppc/xsys/unix/asm_linux_ppc.s and misc/ppc/xsys/cpu/cpu_ppc.go to
+copies of x/sys found in the module cache or a vendor directory, unless
+the copy already ships the file. The module index hash and the compiler
+invocation account for implicit entries; DirContainsReplacement ignores
+them so they may live beneath GOMODCACHE.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0117Su2urNmg96oYM6vhHi1y
+---
+ misc/ppc/xsys/cpu/cpu_ppc.go          | 11 ++++
+ misc/ppc/xsys/unix/asm_linux_ppc.s    | 54 ++++++++++++++++
+ src/cmd/go/internal/cfg/cfg.go        | 55 ++++++++++++++++
+ src/cmd/go/internal/fsys/fsys.go      | 91 +++++++++++++++++++++------
+ src/cmd/go/internal/fsys/fsys_test.go |  6 +-
+ src/cmd/go/internal/modindex/read.go  |  3 +
+ src/cmd/go/internal/work/gc.go        |  2 +-
+ src/cmd/go/internal/work/gccgo.go     |  2 +-
+ 8 files changed, 201 insertions(+), 23 deletions(-)
+ create mode 100644 misc/ppc/xsys/cpu/cpu_ppc.go
+ create mode 100644 misc/ppc/xsys/unix/asm_linux_ppc.s
+
+diff --git a/misc/ppc/xsys/cpu/cpu_ppc.go b/misc/ppc/xsys/cpu/cpu_ppc.go
+new file mode 100644
+index 0000000000..bae5ede930
+--- /dev/null
++++ b/misc/ppc/xsys/cpu/cpu_ppc.go
+@@ -0,0 +1,11 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build ppc
++
++package cpu
++
++const cacheLineSize = 32
++
++func initOptions() {}
+diff --git a/misc/ppc/xsys/unix/asm_linux_ppc.s b/misc/ppc/xsys/unix/asm_linux_ppc.s
+new file mode 100644
+index 0000000000..a5c0371bda
+--- /dev/null
++++ b/misc/ppc/xsys/unix/asm_linux_ppc.s
+@@ -0,0 +1,54 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build linux && ppc && gc
++
++#include "textflag.h"
++
++//
++// System calls for ppc, Linux
++//
++
++// Just jump to package syscall's implementation for all these functions.
++// The runtime may know about them.
++
++TEXT ·Syscall(SB),NOSPLIT,$0-28
++	JMP	syscall·Syscall(SB)
++
++TEXT ·Syscall6(SB),NOSPLIT,$0-40
++	JMP	syscall·Syscall6(SB)
++
++TEXT ·SyscallNoError(SB),NOSPLIT,$0-24
++	BL	runtime·entersyscall(SB)
++	MOVW	a1+4(FP), R3
++	MOVW	a2+8(FP), R4
++	MOVW	a3+12(FP), R5
++	MOVW	R0, R6
++	MOVW	R0, R7
++	MOVW	R0, R8
++	MOVW	trap+0(FP), R9	// syscall entry
++	SYSCALL	R9
++	MOVW	R3, r1+16(FP)
++	MOVW	R0, r2+20(FP)	// r2 is not used on linux/ppc
++	BL	runtime·exitsyscall(SB)
++	RET
++
++TEXT ·RawSyscall(SB),NOSPLIT,$0-28
++	JMP	syscall·RawSyscall(SB)
++
++TEXT ·RawSyscall6(SB),NOSPLIT,$0-40
++	JMP	syscall·RawSyscall6(SB)
++
++TEXT ·RawSyscallNoError(SB),NOSPLIT,$0-24
++	MOVW	a1+4(FP), R3
++	MOVW	a2+8(FP), R4
++	MOVW	a3+12(FP), R5
++	MOVW	R0, R6
++	MOVW	R0, R7
++	MOVW	R0, R8
++	MOVW	trap+0(FP), R9	// syscall entry
++	SYSCALL	R9
++	MOVW	R3, r1+16(FP)
++	MOVW	R0, r2+20(FP)	// r2 is not used on linux/ppc
++	RET
+diff --git a/src/cmd/go/internal/cfg/cfg.go b/src/cmd/go/internal/cfg/cfg.go
+index 5c34612f5d..d120b0c50f 100644
+--- a/src/cmd/go/internal/cfg/cfg.go
++++ b/src/cmd/go/internal/cfg/cfg.go
+@@ -708,3 +708,58 @@ func (d *dirInfo) Mode() fs.FileMode { return d.dir.Type() }
+ func (d *dirInfo) Size() int64        { panic("dirInfo.Size") }
+ func (d *dirInfo) ModTime() time.Time { panic("dirInfo.ModTime") }
+ func (d *dirInfo) Sys() any           { panic("dirInfo.Sys") }
++
++func init() {
++	fsys.Implicit = ppcShims
++}
++
++// ppcShims returns overlay entries that add files to copies of
++// golang.org/x/sys in the module cache (or a vendor directory) when
++// building for GOARCH=ppc. Upstream x/sys has no gc assembly for
++// linux/ppc and no cpu package support for ppc; the linux/ppc port
++// ships them in $GOROOT/misc/ppc/xsys. Entries are only added for
++// directories that exist and do not already contain the file, so
++// a future upstream x/sys that ships them wins automatically.
++func ppcShims() map[string]string {
++	if Goarch != "ppc" {
++		return nil
++	}
++	shim := filepath.Join(GOROOT, "misc", "ppc", "xsys")
++	if _, err := os.Stat(shim); err != nil {
++		return nil
++	}
++	files := [][2]string{{"unix", "asm_linux_ppc.s"}, {"cpu", "cpu_ppc.go"}}
++	m := make(map[string]string)
++	add := func(mod string) {
++		for _, f := range files {
++			dir := filepath.Join(mod, f[0])
++			if _, err := os.Stat(dir); err != nil {
++				continue
++			}
++			p := filepath.Join(dir, f[1])
++			if _, err := os.Stat(p); err == nil {
++				continue // the module ships its own copy
++			}
++			m[p] = filepath.Join(shim, f[0], f[1])
++		}
++	}
++	mods, _ := filepath.Glob(filepath.Join(GOMODCACHE, "golang.org", "x", "sys@*"))
++	for _, mod := range mods {
++		add(mod)
++	}
++	// A vendored copy in the main module (or an enclosing one).
++	if dir, err := os.Getwd(); err == nil {
++		for {
++			if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
++				add(filepath.Join(dir, "vendor", "golang.org", "x", "sys"))
++				break
++			}
++			parent := filepath.Dir(dir)
++			if parent == dir {
++				break
++			}
++			dir = parent
++		}
++	}
++	return m
++}
+diff --git a/src/cmd/go/internal/fsys/fsys.go b/src/cmd/go/internal/fsys/fsys.go
+index 0e0821a35f..cd24d65b56 100644
+--- a/src/cmd/go/internal/fsys/fsys.go
++++ b/src/cmd/go/internal/fsys/fsys.go
+@@ -116,6 +116,17 @@ type replace struct {
+ 
+ var binds []replace
+ 
++// Implicit, if set, returns additional overlay entries (old path to
++// replacement path) that are applied after the -overlay file.
++// The linux/ppc port uses it to supply files for golang.org/x/sys that
++// upstream does not ship for GOARCH=ppc (see cfg.ppcShims).
++var Implicit func() map[string]string
++
++// implicit records the absolute "from" paths that came from Implicit
++// rather than from the -overlay file. DirContainsReplacement ignores
++// them, so they may add files beneath GOMODCACHE.
++var implicitPaths map[string]bool
++
+ // Bind makes the virtual file system use dir as if it were mounted at mtpt,
+ // like Plan 9's “bind” or Linux's “mount --bind”, or like os.Symlink
+ // but without the symbolic link.
+@@ -346,22 +357,42 @@ func Init() error {
+ 		return nil
+ 	}
+ 
+-	if OverlayFile == "" {
++	var implicit map[string]string
++	if Implicit != nil {
++		implicit = Implicit()
++	}
++	if OverlayFile == "" && len(implicit) == 0 {
+ 		return nil
+ 	}
+ 
+-	Trace("ReadFile", OverlayFile)
+-	b, err := os.ReadFile(OverlayFile)
+-	if err != nil {
+-		return fmt.Errorf("reading overlay: %v", err)
++	var b []byte
++	if OverlayFile != "" {
++		Trace("ReadFile", OverlayFile)
++		var err error
++		b, err = os.ReadFile(OverlayFile)
++		if err != nil {
++			return fmt.Errorf("reading overlay: %v", err)
++		}
+ 	}
+-	return initFromJSON(b)
++	return initFromJSON(b, implicit)
+ }
+ 
+-func initFromJSON(js []byte) error {
++func initFromJSON(js []byte, implicit map[string]string) error {
+ 	var ojs overlayJSON
+-	if err := json.Unmarshal(js, &ojs); err != nil {
+-		return fmt.Errorf("parsing overlay JSON: %v", err)
++	if len(js) > 0 {
++		if err := json.Unmarshal(js, &ojs); err != nil {
++			return fmt.Errorf("parsing overlay JSON: %v", err)
++		}
++	}
++	implicitFrom := make(map[string]bool)
++	for from, to := range implicit {
++		if ojs.Replace == nil {
++			ojs.Replace = make(map[string]string)
++		}
++		if _, ok := ojs.Replace[from]; !ok {
++			ojs.Replace[from] = to
++			implicitFrom[abs(from)] = true
++		}
+ 	}
+ 
+ 	seen := make(map[string]string)
+@@ -398,6 +429,7 @@ func initFromJSON(js []byte) error {
+ 	}
+ 
+ 	overlay = list
++	implicitPaths = implicitFrom
+ 	return nil
+ }
+ 
+@@ -520,6 +552,29 @@ func Replaced(name string) bool {
+ 	return info.deleted || info.replaced && !info.dir
+ }
+ 
++// HasOverlay reports whether any overlay entries are in effect,
++// whether from the -overlay file or from Implicit.
++func HasOverlay() bool {
++	return len(overlay) > 0
++}
++
++// ImplicitUnder returns the sorted implicit overlay paths beneath dir.
++// It lets callers that cache per-directory state (such as the module
++// index) account for implicit additions.
++func ImplicitUnder(dir string) []string {
++	if len(implicitPaths) == 0 {
++		return nil
++	}
++	adir := abs(dir)
++	var list []string
++	for _, r := range overlay {
++		if implicitPaths[r.from] && str.HasFilePathPrefix(r.from, adir) {
++			list = append(list, r.from)
++		}
++	}
++	return list
++}
++
+ // DirContainsReplacement reports whether the named directory is affected by a replacement,
+ // either because a parent directory has been replaced, it has been replaced, or a file or
+ // directory under it has been replaced.
+@@ -530,16 +585,16 @@ func DirContainsReplacement(name string) (string, bool) {
+ 	apath := abs(name)
+ 
+ 	// Check the overlay using similar logic to what stat uses.
+-	i, ok := slices.BinarySearchFunc(overlay, apath, searchcmp)
+-	if ok {
+-		// The named directory itself has been replaced.
+-		return overlay[i].from, true
+-	}
+-	if i < len(overlay) && str.HasFilePathPrefix(overlay[i].from, apath) {
+-		// A file or directory contained in the named directory has been replaced.
+-		return overlay[i].from, true
++	// Entries that came from Implicit are ignored.
++	i, _ := slices.BinarySearchFunc(overlay, apath, searchcmp)
++	for j := i; j < len(overlay) && str.HasFilePathPrefix(overlay[j].from, apath); j++ {
++		// The named directory itself, or a file or directory
++		// contained in it, has been replaced.
++		if !implicitPaths[overlay[j].from] {
++			return overlay[j].from, true
++		}
+ 	}
+-	if i > 0 && str.HasFilePathPrefix(apath, overlay[i-1].from) {
++	if i > 0 && str.HasFilePathPrefix(apath, overlay[i-1].from) && !implicitPaths[overlay[i-1].from] {
+ 		// A parent of the named directory has been replaced.
+ 		return overlay[i-1].from, true
+ 	}
+diff --git a/src/cmd/go/internal/fsys/fsys_test.go b/src/cmd/go/internal/fsys/fsys_test.go
+index 575eae1e61..63df17a7e9 100644
+--- a/src/cmd/go/internal/fsys/fsys_test.go
++++ b/src/cmd/go/internal/fsys/fsys_test.go
+@@ -48,7 +48,7 @@ func initOverlay(t *testing.T, config string) {
+ 		}
+ 	}
+ 
+-	if err := initFromJSON(a.Comment); err != nil {
++	if err := initFromJSON(a.Comment, nil); err != nil {
+ 		t.Fatal(err)
+ 	}
+ }
+@@ -113,7 +113,7 @@ func TestStatInfo(t *testing.T) {
+ 	overlay := statInfoOverlay
+ 	overlay = winFix(overlay)
+ 	overlay = strings.ReplaceAll(overlay, `\`, `\\`) // JSON escaping
+-	if err := initFromJSON([]byte(overlay)); err != nil {
++	if err := initFromJSON([]byte(overlay), nil); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 
+@@ -1299,7 +1299,7 @@ func TestBadOverlay(t *testing.T) {
+ 			tt.err = strings.ReplaceAll(tt.err, `/tmp`, tmp)   // fix tmp
+ 			tt.err = strings.ReplaceAll(tt.err, `/`, `\`)      // use backslashes
+ 		}
+-		err := initFromJSON([]byte(tt.json))
++		err := initFromJSON([]byte(tt.json), nil)
+ 		if err == nil || err.Error() != tt.err {
+ 			t.Errorf("#%d: err=%v, want %q", i, err, tt.err)
+ 		}
+diff --git a/src/cmd/go/internal/modindex/read.go b/src/cmd/go/internal/modindex/read.go
+index 529c26ea05..09349c89f5 100644
+--- a/src/cmd/go/internal/modindex/read.go
++++ b/src/cmd/go/internal/modindex/read.go
+@@ -72,6 +72,9 @@ func moduleHash(modroot string, ismodcache bool) (cache.ActionID, error) {
+ 	// path@version (perhaps including the checksum?) instead of the module root
+ 	// directory.
+ 	fmt.Fprintf(h, "module index %s %s %v\n", runtime.Version(), indexVersion, modroot)
++	if imp := fsys.ImplicitUnder(modroot); len(imp) > 0 {
++		fmt.Fprintf(h, "implicit overlay %q\n", imp)
++	}
+ 	return h.Sum(), nil
+ }
+ 
+diff --git a/src/cmd/go/internal/work/gc.go b/src/cmd/go/internal/work/gc.go
+index ec198b6469..c91e90c23d 100644
+--- a/src/cmd/go/internal/work/gc.go
++++ b/src/cmd/go/internal/work/gc.go
+@@ -287,7 +287,7 @@ func (a *Action) trimpath() string {
+ 	// package directory here.
+ 	var overlayNonGoRewrites string // rewrites for non-go files
+ 	hasCgoOverlay := false
+-	if fsys.OverlayFile != "" {
++	if fsys.HasOverlay() {
+ 		for _, filename := range a.Package.AllFiles() {
+ 			path := filename
+ 			if !filepath.IsAbs(path) {
+diff --git a/src/cmd/go/internal/work/gccgo.go b/src/cmd/go/internal/work/gccgo.go
+index e0b2388364..faf2fcf938 100644
+--- a/src/cmd/go/internal/work/gccgo.go
++++ b/src/cmd/go/internal/work/gccgo.go
+@@ -108,7 +108,7 @@ func (tools gccgoToolchain) gc(b *Builder, a *Action, archive string, importcfg,
+ 			args = append(args, "-ffile-prefix-map="+base.Cwd()+"=.")
+ 			args = append(args, "-ffile-prefix-map="+b.WorkDir+"=/tmp/go-build")
+ 		}
+-		if fsys.OverlayFile != "" {
++		if fsys.HasOverlay() {
+ 			for _, name := range gofiles {
+ 				absPath := mkAbs(p.Dir, name)
+ 				if !fsys.Replaced(absPath) {
+-- 
+2.55.0
+
