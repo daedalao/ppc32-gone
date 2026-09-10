@@ -1,7 +1,7 @@
 From b520d78e34f39dc7e29beea99b8514f250dde40e Mon Sep 17 00:00:00 2001
 From: daedalao <daedalao@hotmail.com>
 Date: Wed, 9 Sep 2026 03:16:24 -0700
-Subject: [PATCH 11/14] linux/ppc: R12 is clobbered by linker trampolines
+Subject: [PATCH 11/15] linux/ppc: R12 is clobbered by linker trampolines
 
 Linker trampolines use R12 as scratch, so no register allocation or
 assembly may keep a value in R12 across a call. LoweredWB (the write

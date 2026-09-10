@@ -1,7 +1,7 @@
 From a5b33410f98454469c66c3fdc83413409328698f Mon Sep 17 00:00:00 2001
 From: daedalao <daedalao@hotmail.com>
 Date: Tue, 8 Sep 2026 21:19:14 -0700
-Subject: [PATCH 06/14] linux/ppc: register 32-bit atomic intrinsics; fix
+Subject: [PATCH 06/15] linux/ppc: register 32-bit atomic intrinsics; fix
  big-endian memHash64
 
 internal/runtime/maps: on big-endian 32-bit targets memHash64Fallback

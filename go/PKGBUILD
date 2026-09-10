@@ -16,7 +16,7 @@
 pkgname=go
 epoch=2
 pkgver=1.28.ppc32
-pkgrel=4
+pkgrel=5
 _commit=a14b5433261d7ed98b716b0c71e36a46b7148ef2 # go master, 2026-09-08
 pkgdesc='Core compiler tools for the Go programming language (linux/ppc port)'
 arch=(powerpc)
@@ -40,22 +40,24 @@ source=("git+https://go.googlesource.com/go#commit=$_commit"
         "0011-linux-ppc-R12-is-clobbered-by-linker-trampolines.patch"
         "0012-runtime-fix-TestBadTraceback-frame-offset-for-linux-.patch"
         "0013-runtime-drop-SIGPROF-samples-taken-inside-emulated-6.patch"
-        "0014-linux-ppc-position-independent-code-c-shared-c-archi.patch")
+        "0014-linux-ppc-position-independent-code-c-shared-c-archi.patch"
+        "0015-linux-ppc-buildmode-shared-and-linkshared-PC-relativ.patch")
 sha256sums=('SKIP'
-            '2a9936e7ed3b1d160fa5b78e2b152583f81fd6431c1b16b1b22aa87962e5d6b8'
-            '85ff954a05970acb212f6460ed73a796c33e921c86e38dbd83bec8eabb0af23f'
-            'c715bb064d245c9d7eba09993dbeb7fb23d096d32a05048da1eb57091a7413ce'
-            '557f060a15726ad13e407fff4e9544dc6841fde7aaaac1aa370312de4a99824c'
-            '4b8f630c158adab7cad47f058c4cf613295b644cb10f9ec23e194cb33aa72c7d'
-            '0124f4811d8320f983f89ebf9d459ef2229c569688ab84b76e55ab35b85f05a4'
-            'b97994b2fb819db9030f98adc31dd00450736d2c317a44946224cd51a3603742'
-            'fbe61bf08e080eddafe00c039342ec9683747bcf243a70ebc6352e07a067c4a5'
-            'ffd8b4d4afadb77e0480623b0d77da96e3cdfa8f9e87b0fe53616328ff776553'
-            '1831d3b2f5c5b62570340a79c5efb3e5a10b4bb86aadf3572626f0e0aa1c75e5'
-            '9aabb4f8282875ae4308b4d8dd69fd368078223d749101814183e5b413624f59'
-            'a92f864fad28feca1b681c24de87ed4876833e4e9d02b6c8fc2938c7b4235bd0'
-            '98b4d63c8b4d5f0ab10b7210d2058380ed2b20e8632f03385ad8df43c6f83184'
-            'adc91e2b3162201ea031898c38048aa9176eece22901a4ff8dfcf89440da01e8')
+            '81794401f98db0d3bb6775b8b547539955d8b597662fe51acd5733c1035d0714'
+            'd33b43325dbd1090438aec99f025d7eb0cfe12510bed3287cb8e03dffbab990b'
+            '58d6e9997b375ebba22c576c40022580cb41da07436932aabcd7493b4c3d003c'
+            '58dd12c0f682acf6af4f306c894b6a025dfe0ef7b8dbf2608ef30395e5e22a7c'
+            '70ab44495e7407b60d870034b708ea67e4f667ba210309678fca919c047c7eab'
+            'c038030a672750b251844a7ed9b2af5c340e6559004ab9b0cf8bc7ca37cf7d03'
+            'fdf30a555f5f9f001d13acf3fc9b1f3afcf8ae084ff0d64432bfe632d5fd3743'
+            '834c2578333b29e08bcd2d2bf40999fcf4e175a83c544455bae09bed86f949d4'
+            '0cb8ad14e6780c4ce28de5d68d2ff5a6542c2de3abd52e30c2b4a250b73c7a85'
+            '8423fa2e59b8bf86212e8aa290a3ef4ed9ffd4a86b502fbdec5104953d675aef'
+            '1763d26ca6f056d92b257308370a7eb9b9d3d5e90428e28818cdfc9a41d280ef'
+            '4959b72c738f55a7bf4f58556d45cee0d45a6d0cf69221de9b71013d3e4a2bc2'
+            'd2a49d460f7ffd602e0335e5c02b7c8108ad3f817942b0d0014bc22e875529e1'
+            'ebbaf85200503ab559736539c4d325efdaa908d3b315dd4837b27444a93a86e9'
+            'c205711365de19fc9ecf7866504fbf4729792575bf7560f68190c2824f302dee')
 
 prepare() {
   cd go

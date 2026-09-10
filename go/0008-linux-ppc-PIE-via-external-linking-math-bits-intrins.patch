@@ -1,7 +1,7 @@
 From 8471fc322ab16e49710df7d5bc2522daec886a08 Mon Sep 17 00:00:00 2001
 From: daedalao <daedalao@hotmail.com>
 Date: Wed, 9 Sep 2026 02:08:31 -0700
-Subject: [PATCH 08/14] linux/ppc: PIE via external linking, math/bits
+Subject: [PATCH 08/15] linux/ppc: PIE via external linking, math/bits
  intrinsics, objdump support
 
 -buildmode=pie is now supported for linux/ppc. 32-bit PowerPC has no

@@ -1,7 +1,7 @@
 From 601792d36a3f7bdeceb3be8407683cdeea485525 Mon Sep 17 00:00:00 2001
 From: daedalao <daedalao@hotmail.com>
 Date: Wed, 9 Sep 2026 03:28:25 -0700
-Subject: [PATCH 12/14] runtime: fix TestBadTraceback frame offset for
+Subject: [PATCH 12/15] runtime: fix TestBadTraceback frame offset for
  linux/ppc
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>

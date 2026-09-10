@@ -1,0 +1,303 @@
+From 7e66099ee18e75fb0ff8a851be13e150ac2f85fb Mon Sep 17 00:00:00 2001
+From: daedalao <daedalao@hotmail.com>
+Date: Wed, 9 Sep 2026 21:11:04 -0700
+Subject: [PATCH 15/15] linux/ppc: -buildmode=shared and -linkshared;
+ PC-relative trampolines and PLT stubs
+
+Enable the last build modes. GNU ld does not build PLT stubs for our
+(unmarked) objects on ppc32 and leaves calls that bind at load time as
+dynamic R_PPC_REL24 relocations, which fail whenever the modules end up
+more than 32 MB apart. The Go linker therefore routes such calls (to
+shared-library symbols, and in plugins to any preemptible symbol) through
+stubs of its own that load the target from a Go-owned data word filled by
+the dynamic linker. libstd.so is linked with -Bsymbolic-functions so its
+internal calls stay direct.
+
+Trampolines and stubs in position independent code compute addresses
+PC-relatively (bcl/mflr) instead of from R13: the runtime resumes a
+function at its deferreturn call site by jumping there, and code reached
+that way has not reloaded R13 after the call. R_ADDRPOWER_PCREL is
+emitted as R_PPC_REL16_HA/LO for the host linker. The plugin host is not
+PIC even though it is linked as DynlinkingGo; trampoline style follows
+the code.
+
+Verified on a PowerBook G4: -linkshared programs against libstd.so
+(goroutines, maps, recovered panics), plugins, c-shared, c-archive.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0117Su2urNmg96oYM6vhHi1y
+---
+ src/cmd/link/internal/ld/data.go   |  12 ++-
+ src/cmd/link/internal/ld/lib.go    |   6 ++
+ src/cmd/link/internal/ppc/asm.go   | 152 ++++++++++++++++++++++++++---
+ src/internal/platform/supported.go |   2 +-
+ 4 files changed, 153 insertions(+), 19 deletions(-)
+
+diff --git a/src/cmd/link/internal/ld/data.go b/src/cmd/link/internal/ld/data.go
+index 029b84e24a..10069e6ecf 100644
+--- a/src/cmd/link/internal/ld/data.go
++++ b/src/cmd/link/internal/ld/data.go
+@@ -85,8 +85,10 @@ func maxSizeTrampolines(ctxt *Link, ldr *loader.Loader, s loader.Sym, isTramp bo
+ 		return n * 12 // Trampolines in ARM64 are 3 instructions.
+ 	case ctxt.IsLOONG64():
+ 		return n * 12 // Trampolines in LOONG64 are 3 instructions.
+-	case ctxt.IsPPC64(), ctxt.IsPPC():
+-		return n * 16 // Trampolines in PPC64 and PPC are 4 instructions.
++	case ctxt.IsPPC64():
++		return n * 16 // Trampolines in PPC64 are 4 instructions.
++	case ctxt.IsPPC():
++		return n * 36 // Position independent trampolines and PLT stubs in PPC are 9 instructions.
+ 	case ctxt.IsRISCV64():
+ 		return n * 8 // Trampolines in RISCV64 are 2 instructions.
+ 	}
+@@ -2750,6 +2752,12 @@ func (ctxt *Link) textaddress() {
+ 		// an indirect call, which at least builds).
+ 		limit = 1
+ 	}
++	if ctxt.IsPPC() && (ctxt.BuildMode == BuildModePlugin || ctxt.IsSharedGoLink()) {
++		// Calls into another module go through linker-generated
++		// stubs (see cmd/link/internal/ppc), which the trampoline
++		// pass creates.
++		limit = 1
++	}
+ 
+ 	// First pass: assign addresses assuming the program is small and will
+ 	// not require trampoline generation.
+diff --git a/src/cmd/link/internal/ld/lib.go b/src/cmd/link/internal/ld/lib.go
+index cb2968cfac..a70b797d7d 100644
+--- a/src/cmd/link/internal/ld/lib.go
++++ b/src/cmd/link/internal/ld/lib.go
+@@ -1692,6 +1692,12 @@ func (ctxt *Link) hostlink() {
+ 			argv = append(argv, "-Wl,-z,relro")
+ 		}
+ 		argv = append(argv, "-shared")
++		if ctxt.IsPPC() {
++			// Keep calls within the library direct: the host linker
++			// would otherwise leave them as dynamic R_PPC_REL24
++			// relocations, which have a 32 MB reach.
++			argv = append(argv, "-Wl,-Bsymbolic-functions")
++		}
+ 	case BuildModePlugin:
+ 		if ctxt.HeadType == objabi.Hdarwin {
+ 			argv = append(argv, "-dynamiclib")
+diff --git a/src/cmd/link/internal/ppc/asm.go b/src/cmd/link/internal/ppc/asm.go
+index 5096723bbc..479e921801 100644
+--- a/src/cmd/link/internal/ppc/asm.go
++++ b/src/cmd/link/internal/ppc/asm.go
+@@ -151,6 +151,11 @@ func elfreloc1(ctxt *ld.Link, out *ld.OutBuf, ldr *loader.Loader, s loader.Sym,
+ 		addr := int64(ldr.SymSect(s).Vaddr) + sectoff
+ 		write(elfRPPCREL16HA, sectoff+fixupBe, r.Xadd+addr+fixupBe-base)
+ 		write(elfRPPCREL16LO, sectoff+fixupBe+4, r.Xadd+addr+fixupBe+4-base)
++	case objabi.R_ADDRPOWER_PCREL:
++		// S + A - P with P the addis: each half's own field lies
++		// fixupBe (+4) bytes past it.
++		write(elfRPPCREL16HA, sectoff+fixupBe, r.Xadd+fixupBe)
++		write(elfRPPCREL16LO, sectoff+fixupBe+4, r.Xadd+fixupBe+4)
+ 	case objabi.R_CALLPOWER:
+ 		if r.Size != 4 {
+ 			return false
+@@ -189,12 +194,11 @@ func computeLO(val int32) uint32 {
+ func archreloc(target *ld.Target, ldr *loader.Loader, syms *ld.ArchSyms, r loader.Reloc, s loader.Sym, val int64) (o int64, nExtReloc int, ok bool) {
+ 	rs := r.Sym()
+ 
+-	if r.Type() == objabi.R_ADDRPOWER_PCREL {
+-		// addis/addi pair computing S + A - P; used by the position
+-		// independent code preamble to derive the module base from
+-		// the function's own address. Both ends are in the text
+-		// section, so this resolves the same way for internal and
+-		// external linking.
++	if r.Type() == objabi.R_ADDRPOWER_PCREL && !target.IsExternal() {
++		// addis/D-form pair computing S + A - P (P: the addis); used
++		// by the position independent code preamble, trampolines and
++		// PLT stubs. Externally the host linker resolves it, see
++		// elfreloc1.
+ 		t := ldr.SymValue(rs) + r.Add() - (ldr.SymValue(s) + int64(r.Off()))
+ 		o1, o2 := unpackInstPair(val)
+ 		o1 &^= 0xffff
+@@ -208,7 +212,7 @@ func archreloc(target *ld.Target, ldr *loader.Loader, syms *ld.ArchSyms, r loade
+ 		switch r.Type() {
+ 		default:
+ 			return val, 0, false
+-		case objabi.R_ADDRPOWER, objabi.R_POWER_TLS_LE, objabi.R_ADDRPOWER_TOCREL:
++		case objabi.R_ADDRPOWER, objabi.R_POWER_TLS_LE, objabi.R_ADDRPOWER_TOCREL, objabi.R_ADDRPOWER_PCREL:
+ 			return val, 2, true // two ELF relocations, see elfreloc1
+ 		case objabi.R_CALLPOWER:
+ 			return val, 1, true
+@@ -319,7 +323,7 @@ func extreloc(target *ld.Target, ldr *loader.Loader, r loader.Reloc, s loader.Sy
+ 	switch r.Type() {
+ 	case objabi.R_POWER_TLS_LE, objabi.R_CALLPOWER:
+ 		return ld.ExtrelocSimple(ldr, r), true
+-	case objabi.R_ADDRPOWER, objabi.R_ADDRPOWER_TOCREL:
++	case objabi.R_ADDRPOWER, objabi.R_ADDRPOWER_TOCREL, objabi.R_ADDRPOWER_PCREL:
+ 		return ld.ExtrelocViaOuterSym(ldr, r, s), true
+ 	}
+ 	return loader.ExtReloc{}, false
+@@ -345,6 +349,40 @@ const (
+ func trampoline(ctxt *ld.Link, ldr *loader.Loader, ri int, rs, s loader.Sym) {
+ 	relocs := ldr.Relocs(s)
+ 	r := relocs.At(ri)
++
++	if r.Type() == objabi.R_CALLPOWER && needsPLTStub(ctxt, ldr, rs) {
++		// A call that binds at load time to another module. The host
++		// linker would leave a dynamic R_PPC_REL24, which fails when
++		// the modules are more than 32 MB apart, so call through a
++		// stub of our own that loads the address from a word the
++		// dynamic linker fills in (see genpltstub).
++		name := ldr.SymName(rs) + "-plt"
++		if r.Add() != 0 {
++			name = fmt.Sprintf("%s%+x-plt", ldr.SymName(rs), r.Add())
++		}
++		stub := ldr.LookupOrCreateSym(name, ldr.SymVersion(rs))
++		if ldr.SymType(stub) == 0 {
++			sb := ldr.MakeSymbolUpdater(stub)
++			ctxt.AddTramp(sb, ldr.SymType(s))
++			genpltstub(ctxt, ldr, sb, rs, r.Add())
++			if ldr.SymName(rs) == "runtime.deferreturn" {
++				// The pcln table records where a function
++				// calls deferreturn; keep that findable.
++				ldr.SetIsDeferReturnTramp(stub, true)
++			}
++		}
++		sb := ldr.MakeSymbolUpdater(s)
++		srelocs := sb.Relocs()
++		rr := srelocs.At(ri)
++		rr.SetSym(stub)
++		rr.SetAdd(0)
++		// The stub itself may still be out of range: fall through to
++		// the ordinary trampoline logic with the new target.
++		rs = stub
++		relocs = ldr.Relocs(s)
++		r = relocs.At(ri)
++	}
++
+ 	var t int64
+ 	// ldr.SymValue(rs) == 0 indicates a cross-package jump to a function that is not yet
+ 	// laid out. Conservatively use a trampoline.
+@@ -413,15 +451,20 @@ func gentramp(ctxt *ld.Link, ldr *loader.Loader, tramp *loader.SymbolBuilder, ta
+ 
+ 	t := ldr.SymValue(target)
+ 	if pic(ctxt) {
+-		// Position independent code: R13 holds the module base in
+-		// every Go function, and so at every call site. Address the
+-		// target relative to it (addis r12,r13,ha; addi r12,r12,lo).
+-		o1 = 0x3d8d0000 // addis r12,r13,0
+-		r, _ := tramp.AddRel(objabi.R_ADDRPOWER_TOCREL)
+-		r.SetOff(0)
++		// Position independent code: compute the target address
++		// relative to the trampoline's own address.
++		tramp.SetSize(36)
++		P = make([]byte, 36)
++		off := pcrelAddr(ctxt, P, 14<<26) // addi
++		r, _ := tramp.AddRel(objabi.R_ADDRPOWER_PCREL)
++		r.SetOff(int32(off))
+ 		r.SetSiz(8)
+ 		r.SetSym(target)
+-		r.SetAdd(offset)
++		r.SetAdd(offset + pcrelAddend)
++		ctxt.Arch.ByteOrder.PutUint32(P[28:], opMtctrR12)
++		ctxt.Arch.ByteOrder.PutUint32(P[32:], opBctr)
++		tramp.SetData(P)
++		return
+ 	} else if t == 0 || ctxt.IsExternal() {
+ 		// Target address is unknown, or the external linker will lay
+ 		// out the sections: generate an ADDR16_HA/ADDR16_LO pair.
+@@ -451,5 +494,82 @@ func pic(ctxt *ld.Link) bool {
+ 	case ld.BuildModeCShared, ld.BuildModeCArchive, ld.BuildModePlugin, ld.BuildModeShared:
+ 		return true
+ 	}
+-	return ctxt.DynlinkingGo()
++	// An executable linked against shared Go libraries is PIC; the host
++	// of plugins (DynlinkingGo, but BuildModeExe) is not.
++	return ctxt.IsSharedGoLink()
++}
++
++// pcrelAddr writes the position independent address computation used by
++// trampolines and PLT stubs into P, and returns the offset of the
++// addis/D-form pair for its R_ADDRPOWER_PCREL relocation:
++//
++//	mflr  r0
++//	bcl   20,31,$+4
++//	mflr  r12
++//	mtlr  r0
++//	li    r0, 0
++//	addis r12, r12, (sym - here)@ha
++//	<op>  r12, (sym - here)@l(r12)    (addi: address; lwz: contents)
++//
++// This does not depend on R13: the runtime resumes a function at its
++// deferreturn call site by jumping there, and code reached that way has
++// not reloaded its base pointer after the call. R0 is the Go zero
++// register and is restored; R12 is a scratch register at any call.
++func pcrelAddr(ctxt *ld.Link, P []byte, op uint32) int {
++	bo := ctxt.Arch.ByteOrder
++	bo.PutUint32(P[0:], 0x7c0802a6)        // mflr r0
++	bo.PutUint32(P[4:], 0x429f0005)        // bcl 20,31,$+4
++	bo.PutUint32(P[8:], 0x7d8802a6)        // mflr r12
++	bo.PutUint32(P[12:], 0x7c0803a6)       // mtlr r0
++	bo.PutUint32(P[16:], 0x38000000)       // li r0,0
++	bo.PutUint32(P[20:], 0x3d8c0000)       // addis r12,r12,0
++	bo.PutUint32(P[24:], op|12<<21|12<<16) // <op> r12,0(r12)
++	return 20
++}
++
++// pcrelAddend is the addend for the R_ADDRPOWER_PCREL relocation of
++// pcrelAddr: the relocation computes S + A - P with P the address of the
++// addis, while the value in R12 is the address of the mflr (P - 12).
++const pcrelAddend = 12
++
++// needsPLTStub reports whether a call to rs must bind at load time:
++// rs comes from a shared library, or this is a plugin and rs is a
++// global symbol that the host executable may provide instead.
++func needsPLTStub(ctxt *ld.Link, ldr *loader.Loader, rs loader.Sym) bool {
++	if ldr.SymType(rs) == sym.SDYNIMPORT {
++		return true
++	}
++	if ctxt.BuildMode == ld.BuildModePlugin && !ldr.AttrLocal(rs) && ldr.SymVersion(rs) < sym.SymVerStatic {
++		return true
++	}
++	return false
++}
++
++// genpltstub writes a stub that jumps to target (+offset) through a
++// data word "go:plt.<target>" holding its address, filled in by the
++// dynamic linker: the address computation of pcrelAddr with lwz, then
++// mtctr r12; bctr.
++func genpltstub(ctxt *ld.Link, ldr *loader.Loader, stub *loader.SymbolBuilder, target loader.Sym, offset int64) {
++	wname := "go:plt." + ldr.SymName(target)
++	word := ldr.LookupOrCreateSym(wname, ldr.SymVersion(target))
++	if ldr.SymType(word) == 0 {
++		wb := ldr.MakeSymbolUpdater(word)
++		wb.SetType(sym.SNOPTRDATA)
++		wb.SetAlign(4)
++		wb.AddAddrPlus(ctxt.Arch, target, offset)
++		ldr.SetAttrReachable(word, true)
++		ldr.SetAttrLocal(word, true)
++	}
++
++	stub.SetSize(36)
++	P := make([]byte, 36)
++	off := pcrelAddr(ctxt, P, 32<<26) // lwz
++	ctxt.Arch.ByteOrder.PutUint32(P[28:], opMtctrR12)
++	ctxt.Arch.ByteOrder.PutUint32(P[32:], opBctr)
++	stub.SetData(P)
++	r, _ := stub.AddRel(objabi.R_ADDRPOWER_PCREL)
++	r.SetOff(int32(off))
++	r.SetSiz(8)
++	r.SetSym(word)
++	r.SetAdd(pcrelAddend)
+ }
+diff --git a/src/internal/platform/supported.go b/src/internal/platform/supported.go
+index 490b545ee0..87b108b05c 100644
+--- a/src/internal/platform/supported.go
++++ b/src/internal/platform/supported.go
+@@ -194,7 +194,7 @@ func BuildModeSupported(compiler, buildmode, goos, goarch string) bool {
+ 
+ 	case "shared":
+ 		switch platform {
+-		case "linux/386", "linux/amd64", "linux/arm", "linux/arm64", "linux/ppc64", "linux/ppc64le", "linux/s390x":
++		case "linux/386", "linux/amd64", "linux/arm", "linux/arm64", "linux/ppc", "linux/ppc64", "linux/ppc64le", "linux/s390x":
+ 			return true
+ 		}
+ 		return false
+-- 
+2.55.0
+

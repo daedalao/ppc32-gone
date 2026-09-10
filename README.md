@@ -36,8 +36,10 @@ the notes in the top-level README of the port for details.
 ## Notes for packagers of Go software on powerpc
 
 - `-buildmode=pie` works (external linking, DT_TEXTREL). cgo works.
-  c-shared, c-archive and plugin work (external linking, no text
-  relocations).
+  c-shared, c-archive, plugin, `-buildmode=shared` and `-linkshared` work
+  (external linking, no text relocations). `go install -buildmode=shared
+  std` needs a writable GOROOT (run it as root against /usr/lib/go, or use
+  a GOROOT copy).
 - Large builds need `GOTMPDIR` and `TMPDIR` on disk if `/tmp` is a small
   tmpfs; the external linker stages the whole program under `TMPDIR`.
 - golang.org/x/sys has no linux/ppc support for the gc compiler upstream;
@@ -71,7 +73,9 @@ trampolines, PIE via external link); runtime with the 32-bit Linux ppc
 syscall ABI, time64 syscalls, ppc32 signal frames, async preemption, cgo.
 No isel/popcnt/fsqrt/lwsync/lbarx are used (the G4 lacks them).
 Build modes: exe, pie (absolute code with dynamic text relocations),
-c-shared, c-archive and plugin (position independent code with R13 as the
-module base register, initial-exec TLS). Known limitations: no vdso, no
-race/msan/asan (their runtimes are 64-bit only), no internal-linking PIE,
-no -buildmode=shared/-linkshared.
+c-shared, c-archive, plugin, shared and -linkshared (position independent
+code with R13 as the module base register, initial-exec TLS, and
+linker-generated PC-relative stubs for calls that bind at load time, since
+GNU ld leaves those as 32 MB-limited dynamic REL24 relocations on ppc32).
+Known limitations: no vdso, no race/msan/asan (their runtimes are 64-bit
+only), no internal-linking PIE.
