@@ -36,6 +36,8 @@ the notes in the top-level README of the port for details.
 ## Notes for packagers of Go software on powerpc
 
 - `-buildmode=pie` works (external linking, DT_TEXTREL). cgo works.
+  c-shared, c-archive and plugin work (external linking, no text
+  relocations).
 - Large builds need `GOTMPDIR` and `TMPDIR` on disk if `/tmp` is a small
   tmpfs; the external linker stages the whole program under `TMPDIR`.
 - golang.org/x/sys has no linux/ppc support for the gc compiler upstream;
@@ -67,6 +69,9 @@ cmd/internal/obj/ppc64 in a 32-bit mode; new SSA backend
 cmd/compile/internal/ppc; new linker cmd/link/internal/ppc (ELF32, RELA,
 trampolines, PIE via external link); runtime with the 32-bit Linux ppc
 syscall ABI, time64 syscalls, ppc32 signal frames, async preemption, cgo.
-No isel/popcnt/fsqrt/lwsync/lbarx are used (the G4 lacks them). Known
-limitations: no vdso, no race/msan/asan, no internal-linking PIE, no
-c-shared/c-archive/plugin.
+No isel/popcnt/fsqrt/lwsync/lbarx are used (the G4 lacks them).
+Build modes: exe, pie (absolute code with dynamic text relocations),
+c-shared, c-archive and plugin (position independent code with R13 as the
+module base register, initial-exec TLS). Known limitations: no vdso, no
+race/msan/asan (their runtimes are 64-bit only), no internal-linking PIE,
+no -buildmode=shared/-linkshared.
