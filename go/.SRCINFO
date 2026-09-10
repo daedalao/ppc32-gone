@@ -1,7 +1,7 @@
 pkgbase = go
 	pkgdesc = Core compiler tools for the Go programming language (linux/ppc port)
 	pkgver = 1.28.ppc32
-	pkgrel = 3
+	pkgrel = 4
 	epoch = 2
 	url = https://go.dev/
 	arch = powerpc

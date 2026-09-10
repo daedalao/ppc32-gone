@@ -16,7 +16,7 @@
 pkgname=go
 epoch=2
 pkgver=1.28.ppc32
-pkgrel=3
+pkgrel=4
 _commit=a14b5433261d7ed98b716b0c71e36a46b7148ef2 # go master, 2026-09-08
 pkgdesc='Core compiler tools for the Go programming language (linux/ppc port)'
 arch=(powerpc)
@@ -66,7 +66,10 @@ prepare() {
   done
   # cmd/dist derives the version from git; the port's commits make that
   # "go1.28-devel_...". Give the package a stable version string instead.
-  printf 'go%s\ntime %s\n' "$pkgver" "$(date -u -d @${SOURCE_DATE_EPOCH:-$(date +%s)} +%Y-%m-%dT%H:%M:%SZ)" > VERSION
+  # It includes pkgrel: cmd/go keys its build cache on the version string
+  # of a release toolchain, so two packages with different code must not
+  # report the same version.
+  printf 'go%s-%s\ntime %s\n' "$pkgver" "$pkgrel" "$(date -u -d @${SOURCE_DATE_EPOCH:-$(date +%s)} +%Y-%m-%dT%H:%M:%SZ)" > VERSION
 }
 
 build() {
