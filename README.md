@@ -37,9 +37,12 @@ the notes in the top-level README of the port for details.
 
 - `-buildmode=pie` works (external linking, DT_TEXTREL). cgo works.
   c-shared, c-archive, plugin, `-buildmode=shared` and `-linkshared` work
-  (external linking, no text relocations). `go install -buildmode=shared
-  std` needs a writable GOROOT (run it as root against /usr/lib/go, or use
-  a GOROOT copy).
+  (external linking, no text relocations). To use `-linkshared`, install the
+  shared standard library first, as root against /usr/lib/go (or into a
+  GOROOT copy): `go install -buildmode=shared -linkshared std` (about 11
+  minutes on a G4). The `-linkshared` on that command matters: without it
+  the archives are compiled with different flags and every user build
+  rebuilds them.
 - Large builds need `GOTMPDIR` and `TMPDIR` on disk if `/tmp` is a small
   tmpfs; the external linker stages the whole program under `TMPDIR`.
 - golang.org/x/sys has no linux/ppc support for the gc compiler upstream;
