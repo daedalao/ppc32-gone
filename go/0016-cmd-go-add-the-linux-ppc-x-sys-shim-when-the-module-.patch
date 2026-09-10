@@ -1,0 +1,146 @@
+From 5ac37d092b1d71643d505d9a21ec69dc081c02df Mon Sep 17 00:00:00 2001
+From: daedalao <daedalao@hotmail.com>
+Date: Wed, 9 Sep 2026 22:19:10 -0700
+Subject: [PATCH 16/16] cmd/go: add the linux/ppc x/sys shim when the module
+ cache extracts x/sys
+
+The implicit overlay was computed once at startup from the module cache,
+so a one-shot 'go install pkg@latest' that downloaded golang.org/x/sys
+during the build did not see the shim until the next run.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0117Su2urNmg96oYM6vhHi1y
+---
+ src/cmd/go/internal/cfg/cfg.go        | 54 +++++++++++++++++----------
+ src/cmd/go/internal/fsys/fsys.go      | 21 +++++++++++
+ src/cmd/go/internal/modfetch/fetch.go |  5 +++
+ 3 files changed, 60 insertions(+), 20 deletions(-)
+
+diff --git a/src/cmd/go/internal/cfg/cfg.go b/src/cmd/go/internal/cfg/cfg.go
+index d120b0c50f..ab2d2eed49 100644
+--- a/src/cmd/go/internal/cfg/cfg.go
++++ b/src/cmd/go/internal/cfg/cfg.go
+@@ -724,34 +724,20 @@ func ppcShims() map[string]string {
+ 	if Goarch != "ppc" {
+ 		return nil
+ 	}
+-	shim := filepath.Join(GOROOT, "misc", "ppc", "xsys")
+-	if _, err := os.Stat(shim); err != nil {
+-		return nil
+-	}
+-	files := [][2]string{{"unix", "asm_linux_ppc.s"}, {"cpu", "cpu_ppc.go"}}
+ 	m := make(map[string]string)
+-	add := func(mod string) {
+-		for _, f := range files {
+-			dir := filepath.Join(mod, f[0])
+-			if _, err := os.Stat(dir); err != nil {
+-				continue
+-			}
+-			p := filepath.Join(dir, f[1])
+-			if _, err := os.Stat(p); err == nil {
+-				continue // the module ships its own copy
+-			}
+-			m[p] = filepath.Join(shim, f[0], f[1])
+-		}
+-	}
+ 	mods, _ := filepath.Glob(filepath.Join(GOMODCACHE, "golang.org", "x", "sys@*"))
+ 	for _, mod := range mods {
+-		add(mod)
++		for k, v := range PPCShimsFor(mod) {
++			m[k] = v
++		}
+ 	}
+ 	// A vendored copy in the main module (or an enclosing one).
+ 	if dir, err := os.Getwd(); err == nil {
+ 		for {
+ 			if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+-				add(filepath.Join(dir, "vendor", "golang.org", "x", "sys"))
++				for k, v := range PPCShimsFor(filepath.Join(dir, "vendor", "golang.org", "x", "sys")) {
++					m[k] = v
++				}
+ 				break
+ 			}
+ 			parent := filepath.Dir(dir)
+@@ -763,3 +749,31 @@ func ppcShims() map[string]string {
+ 	}
+ 	return m
+ }
++
++// PPCShimsFor returns the overlay entries (see ppcShims) for one copy of
++// golang.org/x/sys rooted at mod. It is also called when the module
++// cache extracts a copy during a build, so that a one-shot
++// "go install pkg@latest" sees the files too.
++func PPCShimsFor(mod string) map[string]string {
++	if Goarch != "ppc" {
++		return nil
++	}
++	shim := filepath.Join(GOROOT, "misc", "ppc", "xsys")
++	if _, err := os.Stat(shim); err != nil {
++		return nil
++	}
++	files := [][2]string{{"unix", "asm_linux_ppc.s"}, {"cpu", "cpu_ppc.go"}}
++	m := make(map[string]string)
++	for _, f := range files {
++		dir := filepath.Join(mod, f[0])
++		if _, err := os.Stat(dir); err != nil {
++			continue
++		}
++		p := filepath.Join(dir, f[1])
++		if _, err := os.Stat(p); err == nil {
++			continue // the module ships its own copy
++		}
++		m[p] = filepath.Join(shim, f[0], f[1])
++	}
++	return m
++}
+diff --git a/src/cmd/go/internal/fsys/fsys.go b/src/cmd/go/internal/fsys/fsys.go
+index cd24d65b56..bf701fd96f 100644
+--- a/src/cmd/go/internal/fsys/fsys.go
++++ b/src/cmd/go/internal/fsys/fsys.go
+@@ -552,6 +552,27 @@ func Replaced(name string) bool {
+ 	return info.deleted || info.replaced && !info.dir
+ }
+ 
++// AddImplicit adds implicit overlay entries (see Implicit) after
++// initialization, for directories that appeared later, such as a module
++// extracted into the module cache during the build.
++func AddImplicit(m map[string]string) {
++	if len(m) == 0 {
++		return
++	}
++	if implicitPaths == nil {
++		implicitPaths = make(map[string]bool)
++	}
++	for from, to := range m {
++		afrom := abs(from)
++		if _, ok := slices.BinarySearchFunc(overlay, afrom, searchcmp); ok {
++			continue
++		}
++		overlay = append(overlay, replace{from: afrom, to: abs(to)})
++		implicitPaths[afrom] = true
++	}
++	slices.SortFunc(overlay, func(x, y replace) int { return cmp(x.from, y.from) })
++}
++
+ // HasOverlay reports whether any overlay entries are in effect,
+ // whether from the -overlay file or from Implicit.
+ func HasOverlay() bool {
+diff --git a/src/cmd/go/internal/modfetch/fetch.go b/src/cmd/go/internal/modfetch/fetch.go
+index 671164df2c..342d7dc385 100644
+--- a/src/cmd/go/internal/modfetch/fetch.go
++++ b/src/cmd/go/internal/modfetch/fetch.go
+@@ -56,6 +56,11 @@ func (f *Fetcher) Download(ctx context.Context, mod module.Version) (dir string,
+ 		}
+ 		f.checkMod(ctx, mod)
+ 
++		if mod.Path == "golang.org/x/sys" {
++			// linux/ppc supplies files upstream x/sys lacks; see cfg.PPCShimsFor.
++			fsys.AddImplicit(cfg.PPCShimsFor(dir))
++		}
++
+ 		// If go.mod exists (not an old legacy module), check version is not too new.
+ 		if data, err := os.ReadFile(filepath.Join(dir, "go.mod")); err == nil {
+ 			goVersion := gover.GoModLookup(data, "go")
+-- 
+2.55.0
+

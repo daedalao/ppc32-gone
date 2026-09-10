@@ -1,7 +1,7 @@
 From bd4fdf5c36a20eabd02cda988b9ac16618d76123 Mon Sep 17 00:00:00 2001
 From: daedalao <daedalao@hotmail.com>
 Date: Tue, 8 Sep 2026 21:21:36 -0700
-Subject: [PATCH 07/15] cmd/dist: detect ppc host (uname -m output has a
+Subject: [PATCH 07/16] cmd/dist: detect ppc host (uname -m output has a
  trailing newline)
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>

@@ -1,7 +1,7 @@
 From 7e66099ee18e75fb0ff8a851be13e150ac2f85fb Mon Sep 17 00:00:00 2001
 From: daedalao <daedalao@hotmail.com>
 Date: Wed, 9 Sep 2026 21:11:04 -0700
-Subject: [PATCH 15/15] linux/ppc: -buildmode=shared and -linkshared;
+Subject: [PATCH 15/16] linux/ppc: -buildmode=shared and -linkshared;
  PC-relative trampolines and PLT stubs
 
 Enable the last build modes. GNU ld does not build PLT stubs for our

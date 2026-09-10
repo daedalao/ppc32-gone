@@ -1,7 +1,7 @@
 From 043111a8a50d6218f5bd2a024c2bd1b4fb925859 Mon Sep 17 00:00:00 2001
 From: daedalao <daedalao@hotmail.com>
 Date: Tue, 8 Sep 2026 21:03:12 -0700
-Subject: [PATCH 04/15] cmd/compile: linux/ppc indirect calls must go through
+Subject: [PATCH 04/16] cmd/compile: linux/ppc indirect calls must go through
  LR, not CTR
 
 runtime.asyncPreempt resumes via CTR, so a goroutine preempted between

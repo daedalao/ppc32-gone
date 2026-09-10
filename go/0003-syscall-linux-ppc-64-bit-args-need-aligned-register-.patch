@@ -1,7 +1,7 @@
 From 86ae78c2cd633dde93bcd51a4903f895a023bd43 Mon Sep 17 00:00:00 2001
 From: daedalao <daedalao@hotmail.com>
 Date: Tue, 8 Sep 2026 20:48:11 -0700
-Subject: [PATCH 03/15] syscall: linux/ppc 64-bit args need aligned register
+Subject: [PATCH 03/16] syscall: linux/ppc 64-bit args need aligned register
  pairs
 
 Regenerate zsyscall with mksyscall -b32 -arm so 64-bit arguments are
