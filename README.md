@@ -41,9 +41,23 @@ the notes in the top-level README of the port for details.
 - golang.org/x/sys has no linux/ppc support for the gc compiler upstream;
   this toolchain supplies the two missing files automatically (see
   `/usr/lib/go/misc/ppc/xsys`), so modules using x/sys build unchanged.
-- Generated code that enumerates GOARCH values may not know `ppc`
-  (example: ncruces/go-sqlite3-wasm needs `ppc` added to its big-endian
-  list; `crush-example/PKGBUILD` shows the sed).
+- Generated code that enumerates GOARCH values may not know `ppc`.
+  Example: ncruces/go-sqlite3-wasm (used by charmbracelet/crush) has a
+  compile-time endianness table that lacks `ppc`, so both `big` and
+  `little` are false and it fails to compile. In the package's
+  `prepare()`, vendor and patch it, then build with `-mod=vendor`:
+
+      go mod vendor
+      sed -i 's/runtime.GOARCH == "ppc64" || runtime.GOARCH == "s390x" ||/runtime.GOARCH == "ppc" || &/' \
+        vendor/github.com/ncruces/go-sqlite3-wasm/v3/sqlite3.go
+
+## Licensing
+
+Packaging files (PKGBUILD, .SRCINFO, this README) are 0BSD, like Arch
+Linux's own go package from which the PKGBUILD is derived. The patches
+modify and add to the Go distribution and are under Go's BSD-3-Clause
+license; the built package installs Go's LICENSE under
+/usr/share/licenses/go. See REUSE.toml and LICENSES/.
 
 ## Port summary
 

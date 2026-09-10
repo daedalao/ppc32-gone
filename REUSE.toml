@@ -1,0 +1,22 @@
+version = 1
+
+# Packaging files, in the style of Arch Linux's go package (0BSD).
+[[annotations]]
+path = [
+    "PKGBUILD",
+    "go/PKGBUILD",
+    "go/.SRCINFO",
+    "README.md",
+    ".gitignore",
+]
+SPDX-FileCopyrightText = "Arch Linux contributors, daedalao"
+SPDX-License-Identifier = "0BSD"
+
+# The port itself: modifications to, and new files for, the Go
+# distribution, under Go's license.
+[[annotations]]
+path = [
+    "go/*.patch",
+]
+SPDX-FileCopyrightText = "The Go Authors, daedalao"
+SPDX-License-Identifier = "BSD-3-Clause"
