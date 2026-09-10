@@ -42,7 +42,10 @@ the notes in the top-level README of the port for details.
   GOROOT copy): `go install -buildmode=shared -linkshared std` (about 11
   minutes on a G4). The `-linkshared` on that command matters: without it
   the archives are compiled with different flags and every user build
-  rebuilds them.
+  rebuilds them. cmd/go also rewrites the `.shlibname` files and relinks
+  libstd.so on every `-linkshared` build (about 30 s on a G4), so the
+  pkg/linux_ppc_dynlink directory must be writable by the building user
+  (this is cmd/go behaviour, not specific to the port).
 - Large builds need `GOTMPDIR` and `TMPDIR` on disk if `/tmp` is a small
   tmpfs; the external linker stages the whole program under `TMPDIR`.
 - golang.org/x/sys has no linux/ppc support for the gc compiler upstream;
