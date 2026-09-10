@@ -1,7 +1,7 @@
 From 15ed0af1be77db1edc64421488828cdb031f4adb Mon Sep 17 00:00:00 2001
 From: daedalao <daedalao@hotmail.com>
 Date: Tue, 8 Sep 2026 20:26:57 -0700
-Subject: [PATCH 01/13] all: add linux/ppc (32-bit big-endian PowerPC) port
+Subject: [PATCH 01/14] all: add linux/ppc (32-bit big-endian PowerPC) port
 
 New GOARCH=ppc targeting classic 32-bit PowerPC (G3/G4): assembler 32-bit
 mode in cmd/internal/obj/ppc64, SSA backend (cmd/compile/internal/ppc,

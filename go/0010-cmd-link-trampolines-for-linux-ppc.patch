@@ -1,7 +1,7 @@
 From 6e64a0adb07ec43e0bd015f3296d7231e8360060 Mon Sep 17 00:00:00 2001
 From: daedalao <daedalao@hotmail.com>
 Date: Wed, 9 Sep 2026 03:08:20 -0700
-Subject: [PATCH 10/13] cmd/link: trampolines for linux/ppc
+Subject: [PATCH 10/14] cmd/link: trampolines for linux/ppc
 
 Direct branches on 32-bit PowerPC reach +/-32 MB. Large binaries (for
 example charmbracelet/crush, 120 MB) exceeded that and failed with

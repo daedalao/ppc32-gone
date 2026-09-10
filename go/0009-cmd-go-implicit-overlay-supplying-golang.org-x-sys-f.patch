@@ -1,7 +1,7 @@
 From 649cd7206b8683384307462808e4ee4f11e0d2cf Mon Sep 17 00:00:00 2001
 From: daedalao <daedalao@hotmail.com>
 Date: Wed, 9 Sep 2026 03:01:11 -0700
-Subject: [PATCH 09/13] cmd/go: implicit overlay supplying golang.org/x/sys
+Subject: [PATCH 09/14] cmd/go: implicit overlay supplying golang.org/x/sys
  files for linux/ppc
 
 Upstream golang.org/x/sys ships no gc assembly for linux/ppc and no cpu
